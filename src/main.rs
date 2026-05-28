@@ -18,7 +18,7 @@ struct Cli {
     #[arg(short, long, default_value = "/etc/runic/runic.yaml")]
     config: PathBuf,
 
-    #[arg(long, env = "RUNIC_LOG", default_value = "runic=info,fast_socks5=warn")]
+    #[arg(long, env = "RUNIC_LOG", default_value = "runic=info")]
     log: String,
 }
 

@@ -2,7 +2,7 @@
 name = "runic"
 version = "0.1.0"
 edition = "2021"
-description = "Local SOCKS5 proxy that relays via HTTP CONNECT upstream — drop-in replacement of gost V0"
+description = "Local SOCKS5 proxy that relays via HTTP CONNECT upstream"
 license = "MIT OR Apache-2.0"
 
 [[bin]]

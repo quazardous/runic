@@ -1,8 +1,8 @@
 # runic
 
-Local SOCKS5 proxy that relays via HTTP CONNECT upstream. Drop-in replacement of
-[gost](https://github.com/go-gost/gost) V0 as specified in `skybot#551`, written
-in Rust.
+Local SOCKS5 proxy that relays via HTTP CONNECT upstream, written in Rust.
+Sized as a drop-in replacement of [gost](https://github.com/go-gost/gost) for
+the narrow case "SOCKS5 in, single upstream HTTP CONNECT out, static creds".
 
 ## What it does
 
@@ -24,7 +24,7 @@ in Rust.
 The end-to-end TLS is between the client and the target — runic only sees opaque
 encrypted bytes once the CONNECT succeeds.
 
-## Scope (V0)
+## Scope (this release)
 
 In:
 
@@ -32,13 +32,13 @@ In:
 - Single upstream, static config, env-injected creds.
 - Static YAML config, no admin API, no hot reload.
 
-Out (parking — same list as `skybot#551`, will be tracked in dedicated sub-tickets):
+Out (future):
 
 - Multi-provider routing.
 - Per-task session-ID rotation.
 - Smart fail-rate routing, GB tracking.
 - Admin API, SIGHUP reload.
-- Auth on the SOCKS5 surface (V0 = loopback only).
+- Auth on the SOCKS5 surface (this release = loopback only).
 - UDP ASSOCIATE / BIND.
 
 ## Config
@@ -65,7 +65,7 @@ Required env vars:
 | ---------------------- | -------------------------------------------- |
 | `DATAIMPULSE_LOGIN`    | DataImpulse static-gateway username          |
 | `DATAIMPULSE_PASSWORD` | DataImpulse static-gateway password          |
-| `RUNIC_LOG` (optional) | `tracing` filter, default `runic=info,fast_socks5=warn` |
+| `RUNIC_LOG` (optional) | `tracing` filter, default `runic=info`       |
 
 CLI flags:
 
@@ -87,10 +87,10 @@ docker run --rm -it \
   runic:0.1
 ```
 
-### docker-compose sidecar of skybot
+### docker-compose sidecar
 
-See `docker/runic/compose.snippet.yaml` for the block to paste into the skybot
-compose `services:` map.
+See `docker/runic/compose.snippet.yaml` for the block to paste into your compose
+`services:` map.
 
 ### Local cargo
 
@@ -116,9 +116,9 @@ What it checks:
 
 ## Local-dev note: port 7777 collision
 
-If your dev machine already binds `127.0.0.1:7777` to something else (e.g. an
-aiball daemon), remap the host side of the compose mapping — the container
-still listens on `7777` internally:
+If your dev machine already binds `127.0.0.1:7777` to another process, remap
+the host side of the compose mapping — the container still listens on `7777`
+internally:
 
 ```
 ports:
@@ -126,7 +126,7 @@ ports:
 ```
 
 Then test with `PROXY=127.0.0.1:7780 ./scripts/smoke.sh`. Inside a real
-skybot-sidecar compose this doesn't apply, every container has its own stack.
+sidecar compose this doesn't apply, every container has its own stack.
 
 ## Operational notes
 
@@ -138,12 +138,6 @@ skybot-sidecar compose this doesn't apply, every container has its own stack.
 - **No TLS deps in the binary**: end-to-end TLS is the client's job
   (CONNECT-tunneled), and the DataImpulse gateway speaks plain HTTP CONNECT on
   port 823. → `gcr.io/distroless/static-debian12` is enough at runtime.
-
-## Cross-project link
-
-- `skybot#551` — gost V0 sibling ticket. Same external contract; whichever ships
-  first, skybot swaps the compose service with zero code change on its side.
-- `runic#558` — this implementation ticket.
 
 ## License
 
