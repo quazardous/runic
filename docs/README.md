@@ -7,6 +7,11 @@ Install guides per OS:
 - [`install/linux-systemd.md`](install/linux-systemd.md) — Linux, per-user
   systemd unit, with hot-reload on config change.
 
+Feature guides:
+
+- [`install/socks5-routing.md`](install/socks5-routing.md) — Multi-provider
+  routing via the SOCKS5 username (v0.7+).
+
 Windows desktop and Linux desktop tray app are planned for a later release.
 
 For the project overview, scope and design notes, see the root

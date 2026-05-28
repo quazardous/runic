@@ -142,6 +142,55 @@ pub async fn socks5_connect(
     Ok(sock)
 }
 
+/// Like [`socks5_connect`] but performs the SOCKS5 username/password
+/// sub-negotiation (METHOD 0x02) before issuing the CONNECT request. Used by
+/// V0.7 routing tests where the username carries the routing intent
+/// (`provider=...;sessid=...`).
+pub async fn socks5_connect_with_userpass(
+    local_addr: SocketAddr,
+    username: &str,
+    password: &str,
+    target_host: &str,
+    target_port: u16,
+) -> Result<TcpStream> {
+    let mut sock = TcpStream::connect(local_addr).await?;
+    // Method negotiation: ver=5, nmethods=1, methods=[user/pass].
+    sock.write_all(&[0x05, 0x01, 0x02]).await?;
+    let mut greeting_reply = [0u8; 2];
+    sock.read_exact(&mut greeting_reply).await?;
+    if greeting_reply != [0x05, 0x02] {
+        bail!(
+            "auth negotiation failed: server picked method 0x{:02x}",
+            greeting_reply[1]
+        );
+    }
+    // RFC 1929 userpass: ver=1, ulen, u, plen, p.
+    let mut up_req = Vec::new();
+    up_req.push(0x01u8);
+    up_req.push(username.len() as u8);
+    up_req.extend_from_slice(username.as_bytes());
+    up_req.push(password.len() as u8);
+    up_req.extend_from_slice(password.as_bytes());
+    sock.write_all(&up_req).await?;
+    let mut up_reply = [0u8; 2];
+    sock.read_exact(&mut up_reply).await?;
+    if up_reply[0] != 0x01 || up_reply[1] != 0x00 {
+        bail!("userpass auth refused: status 0x{:02x}", up_reply[1]);
+    }
+    // CONNECT request: ver=5, cmd=1, rsv, atyp=domain, len, domain, port_be.
+    let domain = target_host.as_bytes();
+    let mut req = vec![0x05, 0x01, 0x00, 0x03, domain.len() as u8];
+    req.extend_from_slice(domain);
+    req.extend_from_slice(&target_port.to_be_bytes());
+    sock.write_all(&req).await?;
+    let mut conn_reply = [0u8; 10];
+    sock.read_exact(&mut conn_reply).await?;
+    if conn_reply[1] != 0x00 {
+        bail!("CONNECT failed: SOCKS5 reply code 0x{:02x}", conn_reply[1]);
+    }
+    Ok(sock)
+}
+
 /// Like [`socks5_connect`] but returns the SOCKS5 reply code instead of an
 /// error when CONNECT is rejected — useful when the test wants to assert on
 /// the specific error code (e.g. `0x01` general failure for upstream 407).
@@ -185,4 +234,5 @@ const _: fn() = || {
     let _ = echo_roundtrip;
     let _ = socks5_connect_capture_code;
     let _ = socks5_connect;
+    let _ = socks5_connect_with_userpass;
 };
