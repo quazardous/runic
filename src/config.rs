@@ -104,3 +104,106 @@ impl Config {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn yaml_with(kind: &str, user_env: &str, pass_env: &str) -> String {
+        format!(
+            r#"listen:
+  addr: "127.0.0.1:7777"
+upstream:
+  kind: {kind}
+  host: gw.example.com
+  port: 823
+  auth:
+    username_env: {user_env}
+    password_env: {pass_env}
+"#
+        )
+    }
+
+    fn write_tmp(content: &str) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn loads_valid_yaml() {
+        std::env::set_var("RUNIC_T_CFG_USER_OK", "alice");
+        std::env::set_var("RUNIC_T_CFG_PASS_OK", "s3cret");
+        let f = write_tmp(&yaml_with("http_connect", "RUNIC_T_CFG_USER_OK", "RUNIC_T_CFG_PASS_OK"));
+
+        let cfg = Config::load(f.path()).unwrap();
+
+        assert_eq!(cfg.upstream.host, "gw.example.com");
+        assert_eq!(cfg.upstream.port, 823);
+        assert_eq!(cfg.upstream.auth.username, "alice");
+        assert_eq!(cfg.upstream.auth.password, "s3cret");
+        assert!(matches!(cfg.listen.auth, ListenAuth::None));
+    }
+
+    #[test]
+    fn rejects_malformed_yaml() {
+        let f = write_tmp("this: is: not: valid: yaml: structure: at: all");
+        let err = Config::load(f.path()).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("parse")
+                || err.chain().any(|c| {
+                    let s = c.to_string().to_lowercase();
+                    s.contains("yaml") || s.contains("expected") || s.contains("mapping")
+                }),
+            "expected YAML parse error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_upstream_kind() {
+        std::env::set_var("RUNIC_T_CFG_USER_KIND", "u");
+        std::env::set_var("RUNIC_T_CFG_PASS_KIND", "p");
+        let f = write_tmp(&yaml_with("socks5", "RUNIC_T_CFG_USER_KIND", "RUNIC_T_CFG_PASS_KIND"));
+
+        let err = Config::load(f.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("http_connect"), "got: {msg}");
+        assert!(msg.contains("socks5"), "got: {msg}");
+    }
+
+    #[test]
+    fn missing_env_var_errors_with_var_name() {
+        std::env::remove_var("RUNIC_T_CFG_USER_MISSING");
+        std::env::remove_var("RUNIC_T_CFG_PASS_MISSING");
+        let f = write_tmp(&yaml_with(
+            "http_connect",
+            "RUNIC_T_CFG_USER_MISSING",
+            "RUNIC_T_CFG_PASS_MISSING",
+        ));
+
+        let err = Config::load(f.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("RUNIC_T_CFG_USER_MISSING"),
+            "error should name the missing var, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn upstream_creds_debug_redacts_password() {
+        let creds = UpstreamCreds {
+            username: "alice".to_string(),
+            password: "super-secret-password".to_string(),
+        };
+        let dbg = format!("{creds:?}");
+        assert!(dbg.contains("alice"), "username should be visible: {dbg}");
+        assert!(
+            !dbg.contains("super-secret-password"),
+            "password must be redacted: {dbg}"
+        );
+        assert!(dbg.contains("redacted"), "expected explicit redaction marker: {dbg}");
+    }
+}
+

@@ -3,7 +3,7 @@ use std::net::Ipv6Addr;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
@@ -97,7 +97,10 @@ async fn serve(mut client: TcpStream, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn negotiate_method(client: &mut TcpStream, auth: &ListenAuth) -> Result<()> {
+async fn negotiate_method<S: AsyncRead + AsyncWrite + Unpin>(
+    client: &mut S,
+    auth: &ListenAuth,
+) -> Result<()> {
     let mut hdr = [0u8; 2];
     client.read_exact(&mut hdr).await.context("read greeting")?;
     if hdr[0] != SOCKS5_VERSION {
@@ -128,7 +131,9 @@ async fn negotiate_method(client: &mut TcpStream, auth: &ListenAuth) -> Result<(
     Ok(())
 }
 
-async fn parse_request(client: &mut TcpStream) -> Result<(String, u16)> {
+async fn parse_request<S: AsyncRead + AsyncWrite + Unpin>(
+    client: &mut S,
+) -> Result<(String, u16)> {
     let mut hdr = [0u8; 4];
     client.read_exact(&mut hdr).await.context("read request header")?;
     if hdr[0] != SOCKS5_VERSION {
@@ -178,7 +183,148 @@ async fn parse_request(client: &mut TcpStream) -> Result<(String, u16)> {
     Ok((host, port))
 }
 
-async fn reply(client: &mut TcpStream, rep: u8) -> io::Result<()> {
+async fn reply<S: AsyncWrite + Unpin>(client: &mut S, rep: u8) -> io::Result<()> {
     let buf = [SOCKS5_VERSION, rep, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
     client.write_all(&buf).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+
+    // negotiate_method ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn negotiate_picks_no_auth_when_offered() {
+        let (mut client, mut server) = duplex(64);
+        // Client greeting: ver=5, nmethods=1, methods=[0x00 no-auth]
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+
+        negotiate_method(&mut server, &ListenAuth::None).await.unwrap();
+
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [0x05, METHOD_NO_AUTH]);
+    }
+
+    #[tokio::test]
+    async fn negotiate_rejects_when_no_acceptable_method() {
+        let (mut client, mut server) = duplex(64);
+        // Client offers only username/password (0x02), we want no-auth only.
+        client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+
+        let err = negotiate_method(&mut server, &ListenAuth::None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no acceptable"), "got: {err}");
+
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [0x05, METHOD_NO_ACCEPTABLE]);
+    }
+
+    #[tokio::test]
+    async fn negotiate_rejects_wrong_version() {
+        let (mut client, mut server) = duplex(64);
+        // SOCKS4-ish version byte; we want only SOCKS5.
+        client.write_all(&[0x04, 0x01, 0x00]).await.unwrap();
+
+        let err = negotiate_method(&mut server, &ListenAuth::None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("0x04"), "got: {err}");
+    }
+
+    // parse_request ------------------------------------------------------------
+
+    #[tokio::test]
+    async fn parse_request_ipv4_443() {
+        let (mut client, mut server) = duplex(64);
+        // ver, cmd=CONNECT, rsv, atyp=IPv4, 192.168.1.10, port=443
+        client
+            .write_all(&[0x05, 0x01, 0x00, 0x01, 192, 168, 1, 10, 0x01, 0xbb])
+            .await
+            .unwrap();
+
+        let (host, port) = parse_request(&mut server).await.unwrap();
+        assert_eq!(host, "192.168.1.10");
+        assert_eq!(port, 443);
+    }
+
+    #[tokio::test]
+    async fn parse_request_ipv6_80() {
+        let (mut client, mut server) = duplex(64);
+        // ::1 in IPv6
+        let mut buf = vec![0x05, 0x01, 0x00, 0x04];
+        buf.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        buf.extend_from_slice(&[0x00, 0x50]);
+        client.write_all(&buf).await.unwrap();
+
+        let (host, port) = parse_request(&mut server).await.unwrap();
+        assert_eq!(host, "::1");
+        assert_eq!(port, 80);
+    }
+
+    #[tokio::test]
+    async fn parse_request_domain_example_com_443() {
+        let (mut client, mut server) = duplex(64);
+        let domain = b"example.com";
+        let mut buf = vec![0x05, 0x01, 0x00, 0x03, domain.len() as u8];
+        buf.extend_from_slice(domain);
+        buf.extend_from_slice(&[0x01, 0xbb]);
+        client.write_all(&buf).await.unwrap();
+
+        let (host, port) = parse_request(&mut server).await.unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 443);
+    }
+
+    #[tokio::test]
+    async fn parse_request_rejects_cmd_bind_with_reply() {
+        let (mut client, mut server) = duplex(64);
+        // CMD=BIND (0x02), unsupported.
+        client
+            .write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0x00, 0x00])
+            .await
+            .unwrap();
+
+        let err = parse_request(&mut server).await.unwrap_err();
+        assert!(err.to_string().contains("0x02"), "got: {err}");
+
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[0], 0x05);
+        assert_eq!(reply[1], REPLY_CMD_NOT_SUPPORTED);
+    }
+
+    #[tokio::test]
+    async fn parse_request_rejects_atyp_unknown_with_reply() {
+        let (mut client, mut server) = duplex(64);
+        // CMD=CONNECT, ATYP=0x99 (invalid).
+        client
+            .write_all(&[0x05, 0x01, 0x00, 0x99])
+            .await
+            .unwrap();
+
+        let err = parse_request(&mut server).await.unwrap_err();
+        assert!(err.to_string().contains("0x99"), "got: {err}");
+
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[0], 0x05);
+        assert_eq!(reply[1], REPLY_ATYP_NOT_SUPPORTED);
+    }
+
+    #[tokio::test]
+    async fn parse_request_rejects_wrong_version() {
+        let (mut client, mut server) = duplex(64);
+        client
+            .write_all(&[0x04, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0x00, 0x00])
+            .await
+            .unwrap();
+
+        let err = parse_request(&mut server).await.unwrap_err();
+        assert!(err.to_string().contains("0x04"), "got: {err}");
+    }
 }

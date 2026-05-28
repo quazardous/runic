@@ -67,6 +67,7 @@ async fn read_response_head(stream: &mut TcpStream) -> Result<Vec<u8>> {
     }
 }
 
+#[derive(Debug)]
 struct StatusLine {
     code: u16,
     reason: String,
@@ -94,4 +95,60 @@ fn parse_status_line(head: &[u8]) -> Result<StatusLine> {
         .with_context(|| format!("upstream status code unparseable: '{code_str}'"))?;
 
     Ok(StatusLine { code, reason })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_200_connection_established() {
+        let head = b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: foo\r\n\r\n";
+        let s = parse_status_line(head).unwrap();
+        assert_eq!(s.code, 200);
+        assert_eq!(s.reason, "Connection Established");
+    }
+
+    #[test]
+    fn parses_407_no_user() {
+        let head = b"HTTP/1.1 407 NO_USER\r\nProxy-Authenticate: Basic\r\n\r\n";
+        let s = parse_status_line(head).unwrap();
+        assert_eq!(s.code, 407);
+        assert_eq!(s.reason, "NO_USER");
+    }
+
+    #[test]
+    fn parses_200_minimal_no_reason() {
+        // Some upstreams send just "HTTP/1.1 200\r\n\r\n" with no reason phrase.
+        let head = b"HTTP/1.1 200 \r\n\r\n";
+        let s = parse_status_line(head).unwrap();
+        assert_eq!(s.code, 200);
+        assert_eq!(s.reason, "");
+    }
+
+    #[test]
+    fn rejects_no_crlf() {
+        let head = b"HTTP/1.1 200 OK";
+        let err = parse_status_line(head).unwrap_err();
+        assert!(
+            err.to_string().contains("CRLF") || err.to_string().contains("no CRLF"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_unparseable_code() {
+        let head = b"HTTP/1.1 XYZ Some Reason\r\n\r\n";
+        let err = parse_status_line(head).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("XYZ") || msg.contains("unparseable"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_missing_code() {
+        let head = b"HTTP/1.1 \r\n\r\n";
+        // splitn(3, ' ') on "HTTP/1.1 " → ["HTTP/1.1", "", ""], code = "" which fails to parse.
+        let err = parse_status_line(head).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("unparseable"), "got: {err}");
+    }
 }
