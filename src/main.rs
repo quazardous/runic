@@ -3,6 +3,9 @@ mod server;
 mod upstream;
 mod watcher;
 
+#[cfg(test)]
+mod test_helpers;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

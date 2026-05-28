@@ -327,4 +327,122 @@ mod tests {
         let err = parse_request(&mut server).await.unwrap_err();
         assert!(err.to_string().contains("0x04"), "got: {err}");
     }
+
+    // End-to-end integration: real SOCKS5 client → server::run → mock upstream.
+    // ------------------------------------------------------------------------
+
+    use crate::config::{Listen, ListenAuth, Upstream, UpstreamCreds};
+    use crate::test_helpers::{
+        echo_roundtrip, pick_free_port, socks5_connect, socks5_connect_capture_code,
+        spawn_mock_upstream, MockBehavior,
+    };
+    use std::time::Duration;
+
+    fn cfg_for(listen_addr: std::net::SocketAddr, upstream_addr: std::net::SocketAddr, user: &str, pass: &str) -> Config {
+        Config {
+            listen: Listen {
+                addr: listen_addr,
+                auth: ListenAuth::None,
+            },
+            upstream: Upstream {
+                host: upstream_addr.ip().to_string(),
+                port: upstream_addr.port(),
+                auth: UpstreamCreds {
+                    username: user.to_string(),
+                    password: pass.to_string(),
+                },
+            },
+        }
+    }
+
+    async fn wait_until_listening(addr: std::net::SocketAddr) {
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("server didn't start listening on {addr} within 1s");
+    }
+
+    #[tokio::test]
+    async fn e2e_socks5_through_runic_to_upstream_echoes() {
+        let upstream_addr =
+            spawn_mock_upstream(MockBehavior::Echo, "alice", "s3cret").await;
+        let listen_addr = pick_free_port();
+        let cfg = cfg_for(listen_addr, upstream_addr, "alice", "s3cret");
+        let (_tx, rx) = watch::channel(Arc::new(cfg));
+
+        tokio::spawn(async move {
+            let _ = run(rx).await;
+        });
+        wait_until_listening(listen_addr).await;
+
+        let mut tunnel = socks5_connect(listen_addr, "any.target.example", 443)
+            .await
+            .expect("SOCKS5 CONNECT should succeed");
+
+        let payload = b"ping-through-tunnel";
+        let echoed = echo_roundtrip(&mut tunnel, payload).await.unwrap();
+        assert_eq!(echoed, payload);
+    }
+
+    #[tokio::test]
+    async fn e2e_upstream_407_surfaces_as_socks5_general_failure() {
+        let upstream_addr =
+            spawn_mock_upstream(MockBehavior::AuthRefused, "", "").await;
+        let listen_addr = pick_free_port();
+        let cfg = cfg_for(listen_addr, upstream_addr, "anyone", "ignored");
+        let (_tx, rx) = watch::channel(Arc::new(cfg));
+
+        tokio::spawn(async move {
+            let _ = run(rx).await;
+        });
+        wait_until_listening(listen_addr).await;
+
+        let code = socks5_connect_capture_code(listen_addr, "any.target.example", 443)
+            .await
+            .expect("SOCKS5 reply readable");
+        assert_eq!(
+            code, REPLY_GENERAL_FAILURE,
+            "expected SOCKS5 general failure (0x01), got 0x{code:02x}"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_rebinds_on_listen_addr_change() {
+        let upstream_addr =
+            spawn_mock_upstream(MockBehavior::Echo, "u", "p").await;
+        let addr1 = pick_free_port();
+        let addr2 = pick_free_port();
+        let cfg1 = cfg_for(addr1, upstream_addr, "u", "p");
+        let (tx, rx) = watch::channel(Arc::new(cfg1));
+
+        tokio::spawn(async move {
+            let _ = run(rx).await;
+        });
+        wait_until_listening(addr1).await;
+
+        // Sanity: addr1 works.
+        let mut t1 = socks5_connect(addr1, "any.example", 443).await.unwrap();
+        let echoed = echo_roundtrip(&mut t1, b"on-addr1").await.unwrap();
+        assert_eq!(echoed, b"on-addr1");
+        drop(t1);
+
+        // Push a new config with addr2 — server should drop its addr1 listener
+        // and rebind on addr2.
+        let upstream2 =
+            spawn_mock_upstream(MockBehavior::Echo, "u", "p").await;
+        let cfg2 = cfg_for(addr2, upstream2, "u", "p");
+        tx.send(Arc::new(cfg2)).unwrap();
+        wait_until_listening(addr2).await;
+
+        let mut t2 = socks5_connect(addr2, "any.example", 443).await.unwrap();
+        let echoed = echo_roundtrip(&mut t2, b"on-addr2").await.unwrap();
+        assert_eq!(echoed, b"on-addr2");
+
+        // And addr1 should now refuse — listener was dropped.
+        let dial_old = tokio::net::TcpStream::connect(addr1).await;
+        assert!(dial_old.is_err(), "addr1 should no longer accept after rebind");
+    }
 }

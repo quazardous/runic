@@ -151,4 +151,68 @@ mod tests {
         let err = parse_status_line(head).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("unparseable"), "got: {err}");
     }
+
+    // connect_via against a mock upstream -----------------------------------
+
+    use crate::config::{Upstream, UpstreamCreds};
+    use crate::test_helpers::{spawn_mock_upstream, MockBehavior};
+
+    fn upstream_pointing_at(addr: std::net::SocketAddr, user: &str, pass: &str) -> Upstream {
+        Upstream {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            auth: UpstreamCreds {
+                username: user.to_string(),
+                password: pass.to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_via_succeeds_with_valid_creds() {
+        let mock = spawn_mock_upstream(MockBehavior::Echo, "alice", "s3cret").await;
+        let up = upstream_pointing_at(mock, "alice", "s3cret");
+
+        let stream = connect_via(&up, "any.target.example", 443).await.unwrap();
+        // Tunnel is established; the bytes flowing through are now "in the tunnel"
+        // (the mock will echo them). Just verify we have a usable stream.
+        assert!(stream.peer_addr().is_ok());
+    }
+
+    #[tokio::test]
+    async fn connect_via_surfaces_407_with_wrong_creds() {
+        let mock = spawn_mock_upstream(MockBehavior::Echo, "alice", "s3cret").await;
+        let up = upstream_pointing_at(mock, "bob", "wrong");
+
+        let err = connect_via(&up, "any.target.example", 443).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("407"), "expected 407 in error: {msg}");
+        assert!(
+            msg.contains("NO_USER") || msg.contains("rejected"),
+            "expected reason or 'rejected' in error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_via_surfaces_407_when_upstream_always_refuses() {
+        let mock = spawn_mock_upstream(MockBehavior::AuthRefused, "", "").await;
+        let up = upstream_pointing_at(mock, "anyone", "anything");
+
+        let err = connect_via(&up, "any.target.example", 443).await.unwrap_err();
+        assert!(err.to_string().contains("407"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn connect_via_fails_when_upstream_unreachable() {
+        // Pick a free port and don't bind anything to it — dial must fail.
+        let dead = crate::test_helpers::pick_free_port();
+        let up = upstream_pointing_at(dead, "u", "p");
+
+        let err = connect_via(&up, "any.target.example", 443).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("dial upstream") || msg.contains("refused"),
+            "expected dial-failure error, got: {msg}"
+        );
+    }
 }
