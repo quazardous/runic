@@ -87,7 +87,7 @@ What is **not** hot-reloadable in this release:
 ## Reload check
 
 ```bash
-# Edit the upstream host to something that resolves but can't accept the chain
+# Edit the default upstream host to something that resolves but can't accept the chain
 sed -i 's/host: gw.dataimpulse.com/host: example.invalid/' ~/.config/runic/runic.yaml
 
 # Wait < 1s for the watcher to pick it up, then:

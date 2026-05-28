@@ -77,13 +77,14 @@ mod tests {
             r#"listen:
   addr: "127.0.0.1:0"
   auth: none
-upstream:
-  kind: http_connect
-  host: {upstream_host}
-  port: 823
-  auth:
-    username_env: RUNIC_TEST_USER
-    password_env: RUNIC_TEST_PASS
+upstreams:
+  default:
+    kind: http_connect
+    host: {upstream_host}
+    port: 823
+    auth:
+      username_env: RUNIC_TEST_USER
+      password_env: RUNIC_TEST_PASS
 "#
         );
         let mut f = std::fs::OpenOptions::new()
@@ -106,7 +107,7 @@ upstream:
         write_yaml(&path, "gw.first.example").expect("write initial");
 
         let initial = Arc::new(Config::load(&path).expect("load initial"));
-        assert_eq!(initial.upstream.host, "gw.first.example");
+        assert_eq!(initial.default_upstream().host, "gw.first.example");
 
         let mut rx = spawn(path.clone(), initial).expect("spawn watcher");
 
@@ -121,6 +122,6 @@ upstream:
             .expect("watch channel closed unexpectedly");
 
         let updated = rx.borrow();
-        assert_eq!(updated.upstream.host, "gw.second.example");
+        assert_eq!(updated.default_upstream().host, "gw.second.example");
     }
 }

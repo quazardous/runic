@@ -64,13 +64,14 @@ listen:
   addr: "0.0.0.0:7777"        # bound inside container; loopback exposure via host port mapping
   auth: none
 
-upstream:
-  kind: http_connect
-  host: gw.dataimpulse.com
-  port: 823
-  auth:
-    username_env: DATAIMPULSE_LOGIN
-    password_env: DATAIMPULSE_PASSWORD
+upstreams:                    # pool keyed by name; routing layer picks per-session in a future release
+  default:                    # this release routes all traffic through `default`
+    kind: http_connect
+    host: gw.dataimpulse.com
+    port: 823
+    auth:
+      username_env: DATAIMPULSE_LOGIN
+      password_env: DATAIMPULSE_PASSWORD
 ```
 
 Required env vars:

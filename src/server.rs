@@ -29,7 +29,12 @@ pub async fn run(mut cfg_rx: watch::Receiver<Arc<Config>>) -> Result<()> {
     let mut listener = TcpListener::bind(current_addr)
         .await
         .with_context(|| format!("bind SOCKS5 listener on {current_addr}"))?;
-    info!(addr = %current_addr, upstream = %format!("{}:{}", initial.upstream.host, initial.upstream.port), "runic listening");
+    info!(
+        addr = %current_addr,
+        upstream_default = %format!("{}:{}", initial.default_upstream().host, initial.default_upstream().port),
+        pool_size = initial.upstreams.len(),
+        "runic listening"
+    );
 
     loop {
         tokio::select! {
@@ -78,7 +83,7 @@ async fn serve(mut client: TcpStream, cfg: &Config) -> Result<()> {
     let (host, port) = parse_request(&mut client).await?;
     debug!(%host, port, "client requested CONNECT");
 
-    let mut upstream_stream = match upstream::connect_via(&cfg.upstream, &host, port).await {
+    let mut upstream_stream = match upstream::connect_via(cfg.default_upstream(), &host, port).await {
         Ok(s) => s,
         Err(e) => {
             warn!(%host, port, error = %e, "upstream connect failed");
@@ -331,20 +336,21 @@ mod tests {
     // End-to-end integration: real SOCKS5 client → server::run → mock upstream.
     // ------------------------------------------------------------------------
 
-    use crate::config::{Listen, ListenAuth, Upstream, UpstreamCreds};
+    use crate::config::{
+        Listen, ListenAuth, Upstream, UpstreamCreds, DEFAULT_UPSTREAM_NAME,
+    };
     use crate::test_helpers::{
         echo_roundtrip, pick_free_port, socks5_connect, socks5_connect_capture_code,
         spawn_mock_upstream, MockBehavior,
     };
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     fn cfg_for(listen_addr: std::net::SocketAddr, upstream_addr: std::net::SocketAddr, user: &str, pass: &str) -> Config {
-        Config {
-            listen: Listen {
-                addr: listen_addr,
-                auth: ListenAuth::None,
-            },
-            upstream: Upstream {
+        let mut upstreams = BTreeMap::new();
+        upstreams.insert(
+            DEFAULT_UPSTREAM_NAME.to_string(),
+            Upstream {
                 host: upstream_addr.ip().to_string(),
                 port: upstream_addr.port(),
                 auth: UpstreamCreds {
@@ -352,6 +358,13 @@ mod tests {
                     password: pass.to_string(),
                 },
             },
+        );
+        Config {
+            listen: Listen {
+                addr: listen_addr,
+                auth: ListenAuth::None,
+            },
+            upstreams,
         }
     }
 

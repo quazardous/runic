@@ -4,15 +4,32 @@
 # enforced by docker-compose port mapping `127.0.0.1:7777:7777`), no auth on the
 # SOCKS5 surface (loopback only), upstream HTTP CONNECT to DataImpulse static
 # gateway with creds from env.
+#
+# `upstreams` is a pool keyed by name. The current release routes all traffic
+# through the entry named `default`; future routing layers will pick per-session.
+# Additional named upstreams can already be declared here for forward-compat —
+# they will be ignored by the current code path.
 
 listen:
   addr: "0.0.0.0:7777"
   auth: none
 
-upstream:
-  kind: http_connect
-  host: gw.dataimpulse.com
-  port: 823
-  auth:
-    username_env: DATAIMPULSE_LOGIN
-    password_env: DATAIMPULSE_PASSWORD
+upstreams:
+  default:
+    kind: http_connect
+    host: gw.dataimpulse.com
+    port: 823
+    auth:
+      username_env: DATAIMPULSE_LOGIN
+      password_env: DATAIMPULSE_PASSWORD
+
+  # Forward-compat example (not used yet — declare extra named upstreams here
+  # so a future routing release picks them up without a config rewrite):
+  #
+  # us-residential:
+  #   kind: http_connect
+  #   host: gw-us.example.com
+  #   port: 823
+  #   auth:
+  #     username_env: USRES_LOGIN
+  #     password_env: USRES_PASSWORD
