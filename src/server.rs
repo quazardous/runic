@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, ListenAuth};
@@ -22,27 +23,53 @@ const REPLY_GENERAL_FAILURE: u8 = 0x01;
 const REPLY_CMD_NOT_SUPPORTED: u8 = 0x07;
 const REPLY_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
-pub async fn run(cfg: Config) -> Result<()> {
-    let cfg = Arc::new(cfg);
-    let listener = TcpListener::bind(cfg.listen.addr)
+pub async fn run(mut cfg_rx: watch::Receiver<Arc<Config>>) -> Result<()> {
+    let initial = cfg_rx.borrow().clone();
+    let mut current_addr = initial.listen.addr;
+    let mut listener = TcpListener::bind(current_addr)
         .await
-        .with_context(|| format!("bind SOCKS5 listener on {}", cfg.listen.addr))?;
-    info!(addr = %cfg.listen.addr, upstream = %format!("{}:{}", cfg.upstream.host, cfg.upstream.port), "runic listening");
+        .with_context(|| format!("bind SOCKS5 listener on {current_addr}"))?;
+    info!(addr = %current_addr, upstream = %format!("{}:{}", initial.upstream.host, initial.upstream.port), "runic listening");
 
     loop {
-        let (client, peer) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                error!(?e, "accept failed");
-                continue;
+        tokio::select! {
+            res = listener.accept() => {
+                let (client, peer) = match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!(?e, "accept failed");
+                        continue;
+                    }
+                };
+                let session_cfg = cfg_rx.borrow().clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve(client, &session_cfg).await {
+                        warn!(%peer, error = %e, "session ended with error");
+                    }
+                });
             }
-        };
-        let cfg = cfg.clone();
-        tokio::spawn(async move {
-            if let Err(e) = serve(client, &cfg).await {
-                warn!(%peer, error = %e, "session ended with error");
+            changed = cfg_rx.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                let new_addr = cfg_rx.borrow().listen.addr;
+                if new_addr != current_addr {
+                    info!(old = %current_addr, new = %new_addr, "listen addr changed; attempting rebind");
+                    match TcpListener::bind(new_addr).await {
+                        Ok(new_l) => {
+                            current_addr = new_addr;
+                            listener = new_l;
+                            info!(addr = %current_addr, "rebound");
+                        }
+                        Err(e) => {
+                            warn!(target_addr = %new_addr, error = %e, "rebind failed; staying on previous addr");
+                        }
+                    }
+                } else {
+                    debug!("config changed (upstream / auth); future sessions will use new values");
+                }
             }
-        });
+        }
     }
 }
 

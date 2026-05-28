@@ -1,8 +1,10 @@
 mod config;
 mod server;
 mod upstream;
+mod watcher;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
@@ -32,5 +34,6 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = config::Config::load(&cli.config)?;
-    server::run(cfg).await
+    let cfg_rx = watcher::spawn(cli.config.clone(), Arc::new(cfg))?;
+    server::run(cfg_rx).await
 }
