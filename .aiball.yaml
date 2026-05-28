@@ -1,0 +1,3 @@
+# Bootstrapped by `aiball init`. See .aiball.yaml.example for the full annotated template.
+autopoll:
+  enabled: true

@@ -1,0 +1,18 @@
+# runic V0 — SOCKS5 local → DataImpulse upstream
+#
+# Drop-in replacement of gost V0 (skybot#551). Listens loopback (binding to 0.0.0.0
+# inside the container; loopback exposure is enforced by docker-compose port mapping
+# `127.0.0.1:7777:7777`), no auth on the SOCKS5 surface (loopback only), upstream
+# HTTP CONNECT to DataImpulse static gateway with creds from env.
+
+listen:
+  addr: "0.0.0.0:7777"
+  auth: none
+
+upstream:
+  kind: http_connect
+  host: gw.dataimpulse.com
+  port: 823
+  auth:
+    username_env: DATAIMPULSE_LOGIN
+    password_env: DATAIMPULSE_PASSWORD

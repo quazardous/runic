@@ -1,0 +1,25 @@
+[package]
+name = "runic"
+version = "0.1.0"
+edition = "2021"
+description = "Local SOCKS5 proxy that relays via HTTP CONNECT upstream — drop-in replacement of gost V0"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "runic"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+base64 = "0.22"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

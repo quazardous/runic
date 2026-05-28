@@ -1,0 +1,30 @@
+# Snippet à coller dans le `services:` du docker-compose skybot pour activer le mode
+# `bridge`. Contrat externe identique à ce que gost V0 (skybot#551) aurait offert —
+# côté skybot, RIEN d'autre ne bouge.
+#
+#   ProxyService.resolveForBot() → { endpoint: 'socks5://127.0.0.1:7777', ... }
+#
+# La seule différence à attendre vs gost vanilla : runic n'a pas d'admin API (V0
+# statique, voir hors-scope du ticket runic#558). Si tu veux SIGHUP / reload à
+# chaud / smart routing → V1.
+
+services:
+  runic:
+    image: ghcr.io/quazardous/runic:0.1
+    # Ou en build local :
+    # build:
+    #   context: ../runic           # adapter le chemin selon ton mono-repo
+    #   dockerfile: Dockerfile
+    container_name: runic
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7777:7777"     # loopback only — pas exposé LAN
+    volumes:
+      - ./docker/runic/runic.yaml:/etc/runic/runic.yaml:ro
+    environment:
+      DATAIMPULSE_LOGIN: ${DATAIMPULSE_LOGIN}
+      DATAIMPULSE_PASSWORD: ${DATAIMPULSE_PASSWORD}
+      RUNIC_LOG: "runic=info"
+    # Pas de healthcheck V0 (pas d'endpoint santé) — le service est si simple que
+    # `docker logs runic` + le smoke test curl suffisent. Healthcheck à ajouter en
+    # V1 quand on a un /healthz.

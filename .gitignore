@@ -1,0 +1,11 @@
+/target
+Cargo.lock.bak
+*.swp
+.DS_Store
+
+# Claude Code local-only settings (per repo convention)
+.claude/settings.local.json
+
+# Local-only secrets / config overrides (V0 expects env-injected creds, never commit real ones)
+.env
+.env.local
