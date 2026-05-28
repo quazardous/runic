@@ -4,14 +4,17 @@
 #
 # runic n'a pas d'admin API dans cette release (statique). Si tu veux SIGHUP /
 # reload à chaud / smart routing → version ultérieure.
+#
+# Build context = chemin vers une clone locale du repo runic. Quand l'image
+# GHCR sera publiée, commute en remplaçant le bloc `build:` par
+# `image: ghcr.io/quazardous/runic:0.1`.
 
 services:
   runic:
-    image: ghcr.io/quazardous/runic:0.1
-    # Ou en build local :
-    # build:
-    #   context: ../runic           # adapter le chemin selon ton mono-repo
-    #   dockerfile: Dockerfile
+    build:
+      context: ${RUNIC_REPO:-../runic}       # chemin vers le repo runic (clone local)
+      dockerfile: Dockerfile
+    # image: ghcr.io/quazardous/runic:0.1    # à activer quand l'image GHCR sera publiée
     container_name: runic
     restart: unless-stopped
     ports:

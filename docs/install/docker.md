@@ -25,7 +25,10 @@ for the canonical version with comments):
 ```yaml
 services:
   runic:
-    image: ghcr.io/quazardous/runic:0.1
+    build:
+      context: ${RUNIC_REPO:-../runic}   # path to a local clone of the runic repo
+      dockerfile: Dockerfile
+    # image: ghcr.io/quazardous/runic:0.1   # enable once a published image lands
     container_name: runic
     restart: unless-stopped
     ports:
