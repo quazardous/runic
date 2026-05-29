@@ -1,0 +1,46 @@
+# runic-tray — Windows system-tray front-end over the `runic` core library.
+#
+# STANDALONE crate on purpose: it is NOT a member of the root build, so the
+# Linux CLI build / `cargo test` at the repo root never touch it (its GUI deps
+# need Windows + GTK and aren't fetched on the Linux box). Build it ON WINDOWS:
+#   cd runic-tray && cargo build --release
+# See ../docs/dev/windows-setup.md.
+#
+# NOTE: this crate was authored from the spec and has NOT been compiled here
+# (no Windows toolchain / no network for the GUI deps in the dev sandbox).
+# Treat it as a verified-on-Windows-required scaffold; pin/adjust dep versions
+# when you first build it.
+
+[package]
+name = "runic-tray"
+version = "0.1.0"
+edition = "2021"
+description = "Windows system-tray front-end for runic"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "runic-tray"
+path = "src/main.rs"
+
+[dependencies]
+runic = { path = ".." }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# GUI / tray (fetched + built on Windows; versions to confirm on first build):
+tao = "0.30"
+tray-icon = "0.19"
+
+[target.'cfg(windows)'.dependencies]
+# Auto-start registry write, %APPDATA% resolution, native toasts, etc.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
