@@ -125,6 +125,12 @@ runic's design borrows from prior work, gratefully acknowledged:
 - [firewalld](https://firewalld.org/) — the runtime/permanent mental model the
   admin API exposes (`?permanent=true`, runtime-to-permanent).
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Notable changes are tracked in
+[CHANGELOG.md](CHANGELOG.md).
+
 ## License
 
-Dual-licensed under MIT OR Apache-2.0.
+Dual-licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)
+at your option.
