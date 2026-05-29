@@ -9,3 +9,7 @@ Cargo.lock.bak
 # Local-only secrets / config overrides (V0 expects env-injected creds, never commit real ones)
 .env
 .env.local
+
+# Internal working dir (notes, prior-art scans, bug files) — never pushed to the
+# public repo: may reference private tracker tickets / internal context.
+/dev

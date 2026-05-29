@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_UPSTREAM_NAME: &str = "default";
 
@@ -38,14 +38,35 @@ pub enum ListenAuth {
     None,
 }
 
-#[derive(Debug, Clone)]
+/// Admin control-plane listener config. Boot-time only (the admin address is
+/// read once from the cold YAML; changing it requires a restart). Loopback by
+/// default — the admin API has no auth, so the bind address is the trust
+/// boundary, same stance as the SOCKS5 surface.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Admin {
+    pub addr: SocketAddr,
+}
+
+impl Default for Admin {
+    fn default() -> Self {
+        Self {
+            addr: SocketAddr::from(([127, 0, 0, 1], 7778)),
+        }
+    }
+}
+
+/// A resolved upstream entry. Credentials are in clear (resolved from env or
+/// inline at construction time) so they can be (de)serialized for the snapshot
+/// cache and the admin API. `UpstreamCreds`' manual `Debug` keeps the password
+/// out of logs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Upstream {
     pub host: String,
     pub port: u16,
     pub auth: UpstreamCreds,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpstreamCreds {
     pub username: String,
     pub password: String,
@@ -63,25 +84,84 @@ impl std::fmt::Debug for UpstreamCreds {
 #[derive(Debug, Deserialize)]
 struct RawFile {
     listen: Listen,
-    upstreams: BTreeMap<String, RawUpstream>,
+    #[serde(default)]
+    admin: Admin,
+    upstreams: BTreeMap<String, UpstreamSpec>,
+}
+
+/// Wire shape of one upstream entry, shared by the cold YAML loader and the
+/// admin API POST body. `kind` defaults to `http_connect`; credentials accept
+/// either env-var indirection (`username_env`/`password_env`, cold YAML style)
+/// or inline `username`/`password` (admin API style — allows credential
+/// rotation without a restart).
+#[derive(Debug, Deserialize)]
+pub struct UpstreamSpec {
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    pub host: String,
+    pub port: u16,
+    pub auth: CredsSpec,
+}
+
+fn default_kind() -> String {
+    "http_connect".to_string()
 }
 
 #[derive(Debug, Deserialize)]
-struct RawUpstream {
-    kind: String,
-    host: String,
-    port: u16,
-    auth: RawUpstreamAuth,
+#[serde(untagged)]
+pub enum CredsSpec {
+    /// Env-var indirection (cold YAML). Resolved at parse time.
+    Env {
+        username_env: String,
+        password_env: String,
+    },
+    /// Inline credentials (admin API / snapshot). Used verbatim.
+    Inline { username: String, password: String },
 }
 
-#[derive(Debug, Deserialize)]
-struct RawUpstreamAuth {
-    username_env: String,
-    password_env: String,
+impl UpstreamSpec {
+    /// Validate the kind and resolve credentials into a runtime `Upstream`.
+    /// `name` is used only for error context.
+    pub fn resolve(self, name: &str) -> Result<Upstream> {
+        if self.kind != "http_connect" {
+            return Err(anyhow!(
+                "upstreams.{name}.kind = '{}' not supported (only 'http_connect')",
+                self.kind
+            ));
+        }
+        let auth = match self.auth {
+            CredsSpec::Inline { username, password } => UpstreamCreds { username, password },
+            CredsSpec::Env {
+                username_env,
+                password_env,
+            } => {
+                let username = std::env::var(&username_env).with_context(|| {
+                    format!("env var {username_env} (upstreams.{name}.auth.username_env) not set")
+                })?;
+                let password = std::env::var(&password_env).with_context(|| {
+                    format!("env var {password_env} (upstreams.{name}.auth.password_env) not set")
+                })?;
+                UpstreamCreds { username, password }
+            }
+        };
+        Ok(Upstream {
+            host: self.host,
+            port: self.port,
+            auth,
+        })
+    }
 }
 
 impl Config {
+    /// Load the data-plane config (listen + upstreams). Kept for callers that
+    /// don't need the admin address (tests, watcher reload fallback).
     pub fn load(path: &Path) -> Result<Self> {
+        Ok(Self::load_with_admin(path)?.0)
+    }
+
+    /// Load the full cold config: the data-plane `Config` plus the boot-time
+    /// `Admin` listener address.
+    pub fn load_with_admin(path: &Path) -> Result<(Self, Admin)> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("read config {}", path.display()))?;
         let file: RawFile = serde_yaml::from_str(&raw)
@@ -102,39 +182,18 @@ impl Config {
         }
 
         let mut upstreams = BTreeMap::new();
-        for (name, raw) in file.upstreams {
-            if raw.kind != "http_connect" {
-                return Err(anyhow!(
-                    "upstreams.{name}.kind = '{}' not supported (only 'http_connect')",
-                    raw.kind
-                ));
-            }
-            let username = std::env::var(&raw.auth.username_env).with_context(|| {
-                format!(
-                    "env var {} (upstreams.{name}.auth.username_env) not set",
-                    raw.auth.username_env
-                )
-            })?;
-            let password = std::env::var(&raw.auth.password_env).with_context(|| {
-                format!(
-                    "env var {} (upstreams.{name}.auth.password_env) not set",
-                    raw.auth.password_env
-                )
-            })?;
-            upstreams.insert(
-                name,
-                Upstream {
-                    host: raw.host,
-                    port: raw.port,
-                    auth: UpstreamCreds { username, password },
-                },
-            );
+        for (name, spec) in file.upstreams {
+            let up = spec.resolve(&name)?;
+            upstreams.insert(name, up);
         }
 
-        Ok(Config {
-            listen: file.listen,
-            upstreams,
-        })
+        Ok((
+            Config {
+                listen: file.listen,
+                upstreams,
+            },
+            file.admin,
+        ))
     }
 }
 

@@ -11,6 +11,8 @@ Feature guides:
 
 - [`install/socks5-routing.md`](install/socks5-routing.md) — Multi-provider
   routing via the SOCKS5 username (v0.7+).
+- [`install/admin-api.md`](install/admin-api.md) — Admin API for runtime /
+  permanent config changes, firewalld-style (v0.6+).
 
 Windows desktop and Linux desktop tray app are planned for a later release.
 

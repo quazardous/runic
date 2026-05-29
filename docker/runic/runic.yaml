@@ -5,14 +5,22 @@
 # SOCKS5 surface (loopback only), upstream HTTP CONNECT to DataImpulse static
 # gateway with creds from env.
 #
-# `upstreams` is a pool keyed by name. The current release routes all traffic
-# through the entry named `default`; future routing layers will pick per-session.
-# Additional named upstreams can already be declared here for forward-compat —
-# they will be ignored by the current code path.
+# `upstreams` is a pool keyed by name. Clients pick an upstream per session via
+# the SOCKS5 username (v0.7, see docs/install/socks5-routing.md); traffic with no
+# routing intent falls back to the entry named `default`.
 
 listen:
   addr: "0.0.0.0:7777"
   auth: none
+
+# Admin API (v0.6, see docs/install/admin-api.md): runtime/permanent config.
+# runic starts it on 127.0.0.1:7778 by default — inside the container that is
+# only reachable locally. To drive it from the host, bind 0.0.0.0 here and add
+# `127.0.0.1:7778:7778` to the compose port mapping (same loopback stance as
+# the SOCKS5 surface — the admin API has no auth).
+#
+# admin:
+#   addr: "0.0.0.0:7778"
 
 upstreams:
   default:

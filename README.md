@@ -32,16 +32,16 @@ encrypted bytes once the CONNECT succeeds.
 In:
 
 - SOCKS5 CMD `CONNECT` (TCP only), IPv4 / IPv6 / domain ATYP.
-- Single upstream, static config, env-injected creds.
+- Upstream pool with static YAML config; env-injected or inline creds.
+- Multi-provider routing via the SOCKS5 username (v0.7).
+- Admin API for runtime / permanent config changes (v0.6).
 - YAML config with file-watch hot reload (debounced ~100 ms).
 
 Out (future):
 
-- Multi-provider routing.
-- Per-task session-ID rotation.
+- Per-task session-ID stickiness (parsed, not yet enforced).
 - Smart fail-rate routing, GB tracking.
-- Admin API on a separate port.
-- Auth on the SOCKS5 surface (this release = loopback only).
+- Auth on the SOCKS5 / admin surfaces (this release = loopback only).
 - UDP ASSOCIATE / BIND.
 - Desktop tray app (Windows + Linux).
 
@@ -56,6 +56,9 @@ Per-OS install guides live in [`docs/`](docs/README.md):
 - [`docs/install/socks5-routing.md`](docs/install/socks5-routing.md) —
   Multi-provider routing via the SOCKS5 username (clients pick which
   upstream of the pool to use per session).
+- [`docs/install/admin-api.md`](docs/install/admin-api.md) — Admin API:
+  change the upstream pool at runtime and persist with `?permanent=true`
+  (firewalld-style runtime/permanent).
 
 ## Config reference
 
@@ -67,7 +70,10 @@ listen:
   addr: "0.0.0.0:7777"        # bound inside container; loopback exposure via host port mapping
   auth: none
 
-upstreams:                    # pool keyed by name; routing layer picks per-session in a future release
+admin:                        # optional; runtime/permanent admin API (v0.6), loopback only
+  addr: "127.0.0.1:7778"
+
+upstreams:                    # pool keyed by name; the routing layer picks per session (v0.7)
   default:                    # this release routes all traffic through `default`
     kind: http_connect
     host: gw.dataimpulse.com
@@ -95,12 +101,29 @@ runic [--config /etc/runic/runic.yaml] [--log <env_filter>]
 
 - **Loopback only.** The `127.0.0.1:` prefix in any port mapping is
   load-bearing — don't drop it, the SOCKS5 surface has no auth.
+- **Admin API is loopback + unauthenticated** by default (`127.0.0.1:7778`):
+  the bind address is the trust boundary. `runic.snapshot.json` stores upstream
+  credentials in clear (written `0600`) — treat it as a secret-bearing file.
 - **Logs are plain stdout/stderr**, structured via `tracing`. `RUNIC_LOG` is an
   `EnvFilter` string (e.g. `runic=debug` for more detail).
 - **No state.** Restart is free, no warm-up, no persisted session.
 - **No TLS deps in the binary**: end-to-end TLS is the client's job
   (CONNECT-tunneled), and the DataImpulse gateway speaks plain HTTP CONNECT on
   port 823. → `gcr.io/distroless/static-debian12` is enough at runtime.
+
+## Prior art
+
+runic's design borrows from prior work, gratefully acknowledged:
+
+- [gost](https://github.com/go-gost/gost) — the SOCKS5-in / forward-out baseline
+  runic is a narrow drop-in for, and the resource-per-name admin API shape with
+  a persist toggle.
+- [HAProxy](https://www.haproxy.org/) — the runtime-vs-saved-config model behind
+  the runtime/permanent split, and the versioned round-trippable state dump.
+- [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust) — idiomatic
+  tokio service structure and lock-free config-sharing patterns.
+- [firewalld](https://firewalld.org/) — the runtime/permanent mental model the
+  admin API exposes (`?permanent=true`, runtime-to-permanent).
 
 ## License
 

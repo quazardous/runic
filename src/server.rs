@@ -87,6 +87,8 @@ pub async fn run(mut cfg_rx: watch::Receiver<Arc<Config>>) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct UserPass {
     pub username: String,
+    /// Reserved for V0.8+ (provider-level secret override); not read in V0.7.
+    #[allow(dead_code)]
     pub password: String,
 }
 
@@ -534,6 +536,7 @@ mod tests {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn cfg_for_two_upstreams(
         listen_addr: std::net::SocketAddr,
         default_up: std::net::SocketAddr,

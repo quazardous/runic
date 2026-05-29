@@ -1,6 +1,8 @@
+mod admin;
 mod config;
 mod routing;
 mod server;
+mod store;
 mod upstream;
 mod watcher;
 
@@ -12,6 +14,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
+use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -37,7 +40,13 @@ async fn main() -> Result<()> {
         .with_target(true)
         .init();
 
-    let cfg = config::Config::load(&cli.config)?;
-    let cfg_rx = watcher::spawn(cli.config.clone(), Arc::new(cfg))?;
+    let (cfg, admin_cfg) = config::Config::load_with_admin(&cli.config)?;
+    let snapshot_path = store::default_snapshot_path();
+    let (config_store, cfg_rx) = store::ConfigStore::new(cfg, snapshot_path);
+    let config_store = Arc::new(Mutex::new(config_store));
+
+    watcher::spawn(cli.config.clone(), config_store.clone())?;
+    admin::spawn(admin_cfg.addr, config_store.clone()).await?;
+
     server::run(cfg_rx).await
 }

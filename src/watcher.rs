@@ -4,16 +4,19 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{timeout, Instant};
 use tracing::{debug, warn};
 
 use crate::config::Config;
+use crate::store::ConfigStore;
 
 const DEBOUNCE_WINDOW: Duration = Duration::from_millis(100);
 
-pub fn spawn(path: PathBuf, initial: Arc<Config>) -> Result<watch::Receiver<Arc<Config>>> {
-    let (cfg_tx, cfg_rx) = watch::channel(initial);
+/// Watch the cold YAML and feed reloads into the shared [`ConfigStore`]. The
+/// store owns the broadcast channel, so a cold reload and an admin mutation
+/// converge on the same apply path ([`ConfigStore::publish`]).
+pub fn spawn(path: PathBuf, store: Arc<Mutex<ConfigStore>>) -> Result<()> {
     let (raw_tx, raw_rx) = mpsc::unbounded_channel::<()>();
 
     let mut watcher = RecommendedWatcher::new(
@@ -30,15 +33,15 @@ pub fn spawn(path: PathBuf, initial: Arc<Config>) -> Result<watch::Receiver<Arc<
         .watch(&path, RecursiveMode::NonRecursive)
         .with_context(|| format!("watch path {}", path.display()))?;
 
-    tokio::spawn(reload_loop(watcher, raw_rx, path, cfg_tx));
-    Ok(cfg_rx)
+    tokio::spawn(reload_loop(watcher, raw_rx, path, store));
+    Ok(())
 }
 
 async fn reload_loop(
     _watcher: RecommendedWatcher,
     mut raw_rx: mpsc::UnboundedReceiver<()>,
     path: PathBuf,
-    cfg_tx: watch::Sender<Arc<Config>>,
+    store: Arc<Mutex<ConfigStore>>,
 ) {
     while raw_rx.recv().await.is_some() {
         let deadline = Instant::now() + DEBOUNCE_WINDOW;
@@ -55,13 +58,11 @@ async fn reload_loop(
 
         match Config::load(&path) {
             Ok(new_cfg) => {
-                debug!(path = %path.display(), "config reloaded");
-                if cfg_tx.send(Arc::new(new_cfg)).is_err() {
-                    return;
-                }
+                debug!(path = %path.display(), "cold config reloaded");
+                store.lock().await.set_cold(new_cfg);
             }
             Err(e) => {
-                warn!(path = %path.display(), error = %e, "config reload failed; keeping previous");
+                warn!(path = %path.display(), error = %e, "cold config reload failed; keeping previous");
             }
         }
     }
@@ -98,7 +99,7 @@ upstreams:
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn reload_on_file_change() {
+    async fn reload_on_file_change_updates_store() {
         std::env::set_var("RUNIC_TEST_USER", "u1");
         std::env::set_var("RUNIC_TEST_PASS", "p1");
 
@@ -106,10 +107,14 @@ upstreams:
         let path = dir.path().join("runic.yaml");
         write_yaml(&path, "gw.first.example").expect("write initial");
 
-        let initial = Arc::new(Config::load(&path).expect("load initial"));
+        let initial = Config::load(&path).expect("load initial");
         assert_eq!(initial.default_upstream().host, "gw.first.example");
 
-        let mut rx = spawn(path.clone(), initial).expect("spawn watcher");
+        let (store, mut rx) =
+            ConfigStore::new(initial, dir.path().join("runic.snapshot.json"));
+        let store = Arc::new(Mutex::new(store));
+
+        spawn(path.clone(), store.clone()).expect("spawn watcher");
 
         // Give the watcher a beat to register the watch before we mutate.
         tokio::time::sleep(Duration::from_millis(50)).await;
