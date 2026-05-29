@@ -14,7 +14,12 @@ Feature guides:
 - [`install/admin-api.md`](install/admin-api.md) — Admin API for runtime /
   permanent config changes, firewalld-style (v0.6+).
 
-Windows desktop and Linux desktop tray app are planned for a later release.
+Development:
+
+- [`dev/windows-setup.md`](dev/windows-setup.md) — set up a Windows workstation
+  to build runic and the planned `runic-tray` app (v1 Windows system tray).
+
+The Windows system-tray app is planned for v1 (Linux uses the systemd path).
 
 For the project overview, scope and design notes, see the root
 [`README.md`](../README.md).

@@ -5,6 +5,10 @@ edition = "2021"
 description = "Local SOCKS5 proxy that relays via HTTP CONNECT upstream"
 license = "MIT OR Apache-2.0"
 
+[lib]
+name = "runic"
+path = "src/lib.rs"
+
 [[bin]]
 name = "runic"
 path = "src/main.rs"

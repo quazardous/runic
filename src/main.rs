@@ -1,13 +1,5 @@
-mod admin;
-mod config;
-mod routing;
-mod server;
-mod store;
-mod upstream;
-mod watcher;
-
-#[cfg(test)]
-mod test_helpers;
+//! Thin CLI shell over the `runic` core library. The planned Windows tray app
+//! (`runic-tray`) is a second shell over the same library.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,6 +8,8 @@ use anyhow::Result;
 use clap::Parser;
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
+
+use runic::{admin, config, server, store, watcher};
 
 #[derive(Parser, Debug)]
 #[command(
