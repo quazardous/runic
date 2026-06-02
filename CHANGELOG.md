@@ -11,7 +11,11 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
-Pre-1.0 development; nothing tagged yet. So far runic can:
+_Nothing yet._
+
+## [0.2.0] - 2026-06-02
+
+Pre-1.0; the first tagged cut. So far runic can:
 
 ### Added
 
