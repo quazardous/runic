@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
     let config_store = Arc::new(Mutex::new(config_store));
 
     watcher::spawn(cli.config.clone(), config_store.clone())?;
-    admin::spawn(admin_cfg.addr, config_store.clone(), silo).await?;
+    admin::spawn(admin_cfg.addr, config_store.clone(), silo.clone()).await?;
 
-    server::run(cfg_rx).await
+    server::run(cfg_rx, silo).await
 }
