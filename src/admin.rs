@@ -25,6 +25,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::config::UpstreamSpec;
+use crate::silo::VariationCache;
 use crate::store::ConfigStore;
 
 const REQUEST_HEAD_LIMIT: usize = 16 * 1024;
@@ -33,7 +34,11 @@ const REQUEST_BODY_LIMIT: usize = 256 * 1024;
 /// Bind the admin listener and spawn its accept loop. Returns the bound address
 /// once the bind succeeds so the caller can fail fast on a port clash (and tests
 /// can target an OS-assigned `:0` port).
-pub async fn spawn(addr: SocketAddr, store: Arc<Mutex<ConfigStore>>) -> Result<SocketAddr> {
+pub async fn spawn(
+    addr: SocketAddr,
+    store: Arc<Mutex<ConfigStore>>,
+    silo: Option<Arc<Mutex<VariationCache>>>,
+) -> Result<SocketAddr> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind admin API on {addr}"))?;
@@ -45,8 +50,9 @@ pub async fn spawn(addr: SocketAddr, store: Arc<Mutex<ConfigStore>>) -> Result<S
             match listener.accept().await {
                 Ok((sock, peer)) => {
                     let store = store.clone();
+                    let silo = silo.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_conn(sock, store, started).await {
+                        if let Err(e) = handle_conn(sock, store, silo, started).await {
                             debug!(%peer, error = %e, "admin connection error");
                         }
                     });
@@ -63,11 +69,14 @@ struct Request {
     path: String,
     query: String,
     body: Vec<u8>,
+    /// Token from an `Authorization: Bearer <token>` header, if present.
+    bearer: Option<String>,
 }
 
 async fn handle_conn(
     mut sock: TcpStream,
     store: Arc<Mutex<ConfigStore>>,
+    silo: Option<Arc<Mutex<VariationCache>>>,
     started: Instant,
 ) -> Result<()> {
     let req = match read_request(&mut sock).await {
@@ -79,7 +88,7 @@ async fn handle_conn(
         }
     };
 
-    let resp = route(&req, &store, started).await;
+    let resp = route(&req, &store, &silo, started).await;
     sock.write_all(&resp)
         .await
         .context("write admin response")?;
@@ -87,7 +96,12 @@ async fn handle_conn(
     Ok(())
 }
 
-async fn route(req: &Request, store: &Arc<Mutex<ConfigStore>>, started: Instant) -> Vec<u8> {
+async fn route(
+    req: &Request,
+    store: &Arc<Mutex<ConfigStore>>,
+    silo: &Option<Arc<Mutex<VariationCache>>>,
+    started: Instant,
+) -> Vec<u8> {
     let permanent = query_flag(&req.query, "permanent");
 
     match (req.method.as_str(), req.path.as_str()) {
@@ -174,6 +188,7 @@ async fn route(req: &Request, store: &Arc<Mutex<ConfigStore>>, started: Instant)
                 &json!({ "active_route": serde_json::Value::Null }),
             )
         }
+        ("POST", "/v1/silo/open") => silo_open(req, silo).await,
         ("POST", path) if path.starts_with("/v1/upstreams/") => {
             let name = match upstream_name(path) {
                 Some(n) => n,
@@ -263,6 +278,46 @@ fn persist_error(e: anyhow::Error) -> Vec<u8> {
     )
 }
 
+/// `POST /v1/silo/open` — the one silo verb (the "variation" notion stays
+/// internal). No `Authorization` → mint a fresh silo token and return it once.
+/// `Authorization: Bearer <token>` → "patte blanche": confirm the token opens a
+/// live variation; an unknown/purged token gets a **distinct** `404
+/// silo_token_unknown` (never a silent mint — the client re-opens without auth).
+async fn silo_open(req: &Request, silo: &Option<Arc<Mutex<VariationCache>>>) -> Vec<u8> {
+    let Some(silo) = silo else {
+        return json_response(
+            404,
+            "Not Found",
+            &json!({ "error": "silo mode not enabled" }),
+        );
+    };
+    let now = unix_now();
+    let mut cache = silo.lock().await;
+    match &req.bearer {
+        None => match cache.create(now) {
+            Ok(token) => json_response(200, "OK", &json!({ "token": token })),
+            Err(e) => json_response(
+                500,
+                "Internal Server Error",
+                &json!({ "error": e.to_string() }),
+            ),
+        },
+        Some(token) => match cache.access(token, now) {
+            Ok(_) => json_response(200, "OK", &json!({ "ok": true })),
+            // Unknown / purged / malformed → orphan signal, deterministic.
+            Err(_) => json_response(404, "Not Found", &json!({ "code": "silo_token_unknown" })),
+        },
+    }
+}
+
+/// Current unix time in seconds (the silo clock for create/access/TTL).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Extract the `<name>` from `/v1/upstreams/<name>` (URL-decoded minimally).
 fn upstream_name(path: &str) -> Option<String> {
     let raw = path.strip_prefix("/v1/upstreams/")?;
@@ -332,10 +387,20 @@ async fn read_request(sock: &mut TcpStream) -> Result<Request> {
     };
 
     let mut content_length = 0usize;
+    let mut bearer = None;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("content-length") {
+            let k = k.trim();
+            if k.eq_ignore_ascii_case("content-length") {
                 content_length = v.trim().parse().unwrap_or(0);
+            } else if k.eq_ignore_ascii_case("authorization") {
+                let v = v.trim();
+                if let Some(tok) = v
+                    .strip_prefix("Bearer ")
+                    .or_else(|| v.strip_prefix("bearer "))
+                {
+                    bearer = Some(tok.trim().to_string());
+                }
             }
         }
     }
@@ -363,6 +428,7 @@ async fn read_request(sock: &mut TcpStream) -> Result<Request> {
         path,
         query,
         body,
+        bearer,
     })
 }
 
@@ -411,11 +477,53 @@ mod tests {
                 let (sock, _) = listener.accept().await.unwrap();
                 let store = store.clone();
                 tokio::spawn(async move {
-                    let _ = handle_conn(sock, store, started).await;
+                    let _ = handle_conn(sock, store, None, started).await;
                 });
             }
         });
         (addr, dir)
+    }
+
+    /// Like [`test_server`] but with silo mode enabled (an empty `VariationCache`).
+    async fn test_server_with_silo() -> (SocketAddr, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cold = Config {
+            listen: Listen {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                auth: ListenAuth::None,
+            },
+            upstreams: BTreeMap::new(),
+            active_route: None,
+        };
+        let (store, _rx) = ConfigStore::new(cold, dir.path().join("runic.snapshot.json"));
+        let store = Arc::new(Mutex::new(store));
+        let cache = crate::silo::VariationCache::new(
+            crate::silo::SiloStore::open(dir.path().join("runic.silo"), 3600).unwrap(),
+            3600,
+        );
+        let silo = Some(Arc::new(Mutex::new(cache)));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let started = Instant::now();
+        tokio::spawn(async move {
+            loop {
+                let (sock, _) = listener.accept().await.unwrap();
+                let store = store.clone();
+                let silo = silo.clone();
+                tokio::spawn(async move {
+                    let _ = handle_conn(sock, store, silo, started).await;
+                });
+            }
+        });
+        (addr, dir)
+    }
+
+    fn post_silo_open(bearer: Option<&str>) -> String {
+        let auth = bearer
+            .map(|t| format!("Authorization: Bearer {t}\r\n"))
+            .unwrap_or_default();
+        format!("POST /v1/silo/open HTTP/1.1\r\nHost: x\r\n{auth}Connection: close\r\n\r\n")
     }
 
     async fn http(addr: SocketAddr, raw: &str) -> (u16, String) {
@@ -524,6 +632,47 @@ mod tests {
         assert_eq!(code, 404);
     }
 
+    // --- silo open ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn silo_open_mints_token() {
+        let (addr, _d) = test_server_with_silo().await;
+        let (code, body) = http(addr, &post_silo_open(None)).await;
+        assert_eq!(code, 200, "got: {body}");
+        assert!(body.contains("\"token\""), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn silo_open_with_valid_token_ok() {
+        let (addr, _d) = test_server_with_silo().await;
+        let (_c, minted) = http(addr, &post_silo_open(None)).await;
+        let token = minted
+            .split("\"token\":\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("token in mint response")
+            .to_string();
+
+        let (code, body) = http(addr, &post_silo_open(Some(&token))).await;
+        assert_eq!(code, 200, "got: {body}");
+        assert!(body.contains("\"ok\":true"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn silo_open_unknown_token_is_404_silo_token_unknown() {
+        let (addr, _d) = test_server_with_silo().await;
+        let (code, body) = http(addr, &post_silo_open(Some("not-a-real-token"))).await;
+        assert_eq!(code, 404);
+        assert!(body.contains("silo_token_unknown"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn silo_open_404_when_silo_disabled() {
+        let (addr, _d) = test_server().await; // no silo
+        let (code, _) = http(addr, &post_silo_open(None)).await;
+        assert_eq!(code, 404);
+    }
+
     fn put_route(name: &str) -> String {
         let body = format!(r#"{{"upstream":"{name}"}}"#);
         format!(
@@ -615,7 +764,9 @@ mod tests {
         let (store, _rx) = ConfigStore::new(cold, dir.path().join("runic.snapshot.json"));
         let store = Arc::new(Mutex::new(store));
 
-        let addr = spawn("127.0.0.1:0".parse().unwrap(), store).await.unwrap();
+        let addr = spawn("127.0.0.1:0".parse().unwrap(), store, None)
+            .await
+            .unwrap();
         let (code, body) = http(
             addr,
             "GET /v1/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",

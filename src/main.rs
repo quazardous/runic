@@ -9,7 +9,11 @@ use clap::Parser;
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
-use runic::{admin, config, server, store, watcher};
+use runic::{admin, config, server, silo, store, watcher};
+
+/// How long a decrypted variation stays warm in RAM after its last use before the
+/// keep-alive cache evicts it (and drops its plaintext config from memory).
+const SILO_IDLE_TTL_SECS: u64 = 300;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -35,21 +39,32 @@ async fn main() -> Result<()> {
         .init();
 
     let (cfg, admin_cfg, silo_cfg) = config::Config::load_with_admin(&cli.config)?;
-    if let Some(silo) = silo_cfg.as_ref().filter(|s| s.enabled) {
-        // Binding layer (variation serving) is wired in a following step; for now
-        // surface that silo mode is selected and which client-binding it expects.
-        tracing::info!(
-            auth = ?silo.auth,
-            ttl_days = silo.ttl_days,
-            "config silo mode enabled"
-        );
-    }
     let snapshot_path = store::default_snapshot_path();
+
+    // Silo mode (opt-in): an encrypted per-variation config store, opened next to
+    // the snapshot. Shared with the admin API (and, in a later slice, the data
+    // plane). Absent ⇒ plain mode, unchanged.
+    let silo = match silo_cfg.as_ref().filter(|s| s.enabled) {
+        Some(s) => {
+            let dir = snapshot_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("runic.silo");
+            let cache = silo::VariationCache::new(
+                silo::SiloStore::open(dir, s.ttl_days * 86_400)?,
+                SILO_IDLE_TTL_SECS,
+            );
+            tracing::info!(auth = ?s.auth, ttl_days = s.ttl_days, "config silo mode enabled");
+            Some(Arc::new(Mutex::new(cache)))
+        }
+        None => None,
+    };
+
     let (config_store, cfg_rx) = store::ConfigStore::new(cfg, snapshot_path);
     let config_store = Arc::new(Mutex::new(config_store));
 
     watcher::spawn(cli.config.clone(), config_store.clone())?;
-    admin::spawn(admin_cfg.addr, config_store.clone()).await?;
+    admin::spawn(admin_cfg.addr, config_store.clone(), silo).await?;
 
     server::run(cfg_rx).await
 }
