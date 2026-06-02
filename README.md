@@ -40,6 +40,12 @@ In:
   live via the admin API (unmatched sessions are declined cleanly).
 - `direct` upstream kind for credential-free local/CI runs — **not proxied**
   (local IP exposed), opt-in only via `RUNIC_ALLOW_DIRECT=1`.
+- Switch the active default route by name, live, via the admin API
+  (`PUT /v1/route/default`) — clients keep the same local port.
+- **Encrypted, per-client config** (opt-in *silo* mode): each client holds its
+  own off-box key; runic keeps only ciphertext + a one-way fingerprint on disk,
+  so a seized box reveals nothing. Bind by token-in-password or a dedicated
+  loopback port. See [`docs/install/silo.md`](docs/install/silo.md).
 
 Out (future):
 
@@ -63,6 +69,8 @@ Per-OS install guides live in [`docs/`](docs/README.md):
 - [`docs/install/admin-api.md`](docs/install/admin-api.md) — Admin API:
   change the upstream pool at runtime and persist with `?permanent=true`
   (firewalld-style runtime/permanent).
+- [`docs/install/silo.md`](docs/install/silo.md) — Config silo: encrypted,
+  per-client config whose keys never touch the box's disk (opt-in).
 
 ## Config reference
 
