@@ -556,6 +556,7 @@ mod tests {
                 auth: ListenAuth::None,
             },
             upstreams,
+            active_route: None,
         }
     }
 
@@ -653,6 +654,7 @@ mod tests {
                 auth: ListenAuth::None,
             },
             upstreams,
+            active_route: None,
         }
     }
 

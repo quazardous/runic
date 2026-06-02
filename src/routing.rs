@@ -49,17 +49,31 @@ pub fn parse_routing_spec(socks5_user: Option<&str>) -> RoutingSpec {
     spec
 }
 
-/// Resolve the upstream that should serve this session. Picks the named
-/// `provider` from the pool when present, otherwise falls back to `default`.
-/// Returns `None` when neither resolves — i.e. an unknown/absent provider and
-/// no `default` entry (a valid state: runic tolerates an empty pool and the
-/// caller fails the session cleanly rather than connecting).
+/// Resolve the upstream that should serve this session. Precedence:
+///
+/// 1. the session's explicit `provider=…` (client's choice always wins);
+/// 2. the admin-settable active-route pointer (`cfg.active_route`);
+/// 3. the entry literally named `default`.
+///
+/// Returns `None` when none resolves — a valid state (empty / default-less
+/// pool): the caller fails the session cleanly rather than connecting.
 pub fn pick_upstream<'a>(cfg: &'a Config, socks5_user: Option<&str>) -> Option<&'a Upstream> {
     let spec = parse_routing_spec(socks5_user);
-    spec.provider
+    if let Some(up) = spec
+        .provider
         .as_ref()
         .and_then(|name| cfg.upstreams.get(name))
-        .or_else(|| cfg.default_upstream())
+    {
+        return Some(up);
+    }
+    if let Some(up) = cfg
+        .active_route
+        .as_ref()
+        .and_then(|name| cfg.upstreams.get(name))
+    {
+        return Some(up);
+    }
+    cfg.default_upstream()
 }
 
 #[cfg(test)]
@@ -97,6 +111,7 @@ mod tests {
                 auth: ListenAuth::None,
             },
             upstreams,
+            active_route: None,
         }
     }
 
@@ -150,6 +165,7 @@ mod tests {
                 auth: ListenAuth::None,
             },
             upstreams,
+            active_route: None,
         }
     }
 
@@ -190,6 +206,28 @@ mod tests {
         );
         assert_eq!(
             pick_upstream(&cfg, Some("=junk")).unwrap().host,
+            "gw-default.example"
+        );
+    }
+
+    #[test]
+    fn active_route_pointer_overrides_default() {
+        let mut cfg = cfg_with("gw-default.example", &[("us", "gw-us.example")]);
+        cfg.active_route = Some("us".to_string());
+
+        // No provider → follows the active-route pointer, not the `default` entry.
+        assert_eq!(pick_upstream(&cfg, None).unwrap().host, "gw-us.example");
+
+        // An explicit provider still wins over the pointer.
+        assert_eq!(
+            pick_upstream(&cfg, Some("provider=default")).unwrap().host,
+            "gw-default.example"
+        );
+
+        // Pointer aimed at a missing name → falls back to the `default` entry.
+        cfg.active_route = Some("ghost".to_string());
+        assert_eq!(
+            pick_upstream(&cfg, None).unwrap().host,
             "gw-default.example"
         );
     }

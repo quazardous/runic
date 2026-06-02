@@ -12,6 +12,11 @@ pub const DEFAULT_UPSTREAM_NAME: &str = "default";
 pub struct Config {
     pub listen: Listen,
     pub upstreams: BTreeMap<String, Upstream>,
+    /// Name of the upstream the no-provider ("default") route resolves to,
+    /// settable live via the admin API (`PUT /v1/route/default`). `None` falls
+    /// back to the entry literally named `default`. This is a runtime pointer —
+    /// switching the active provider by name, without re-sending its creds.
+    pub active_route: Option<String>,
 }
 
 impl Config {
@@ -242,6 +247,9 @@ impl Config {
             Config {
                 listen: file.listen,
                 upstreams,
+                // The active-route pointer is a runtime (admin-API) concept; the
+                // cold YAML doesn't set it. None = fall back to the `default` entry.
+                active_route: None,
             },
             file.admin,
         ))

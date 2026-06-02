@@ -112,6 +112,7 @@ async fn route(req: &Request, store: &Arc<Mutex<ConfigStore>>, started: Instant)
                 &json!({
                     "listen": { "addr": cfg.listen.addr.to_string() },
                     "upstreams": cfg.upstreams,
+                    "active_route": cfg.active_route,
                 }),
             )
         }
@@ -136,6 +137,42 @@ async fn route(req: &Request, store: &Arc<Mutex<ConfigStore>>, started: Instant)
                 Ok(()) => json_response(200, "OK", &json!({ "wiped": true })),
                 Err(e) => persist_error(e),
             }
+        }
+        ("PUT", "/v1/route/default") => {
+            // Point the no-provider ("default") route at a named upstream, live.
+            // Switching by name — the upstream's creds stay put, not re-sent.
+            let name = match serde_json::from_slice::<serde_json::Value>(&req.body)
+                .ok()
+                .and_then(|v| v.get("upstream").and_then(|x| x.as_str()).map(String::from))
+            {
+                Some(n) => n,
+                None => {
+                    return json_response(
+                        400,
+                        "Bad Request",
+                        &json!({ "error": "body must be {\"upstream\":\"<name>\"}" }),
+                    )
+                }
+            };
+            let mut store = store.lock().await;
+            if !store.merged().upstreams.contains_key(&name) {
+                return json_response(
+                    404,
+                    "Not Found",
+                    &json!({ "error": format!("no upstream '{name}' to point the default route at") }),
+                );
+            }
+            store.set_active_route(Some(name.clone()));
+            json_response(200, "OK", &json!({ "active_route": name }))
+        }
+        ("DELETE", "/v1/route/default") => {
+            // Clear the pointer: the default route falls back to the `default` entry.
+            store.lock().await.set_active_route(None);
+            json_response(
+                200,
+                "OK",
+                &json!({ "active_route": serde_json::Value::Null }),
+            )
         }
         ("POST", path) if path.starts_with("/v1/upstreams/") => {
             let name = match upstream_name(path) {
@@ -361,6 +398,7 @@ mod tests {
                 auth: ListenAuth::None,
             },
             upstreams,
+            active_route: None,
         };
         let (store, _rx) = ConfigStore::new(cold, dir.path().join("runic.snapshot.json"));
         let store = Arc::new(Mutex::new(store));
@@ -486,6 +524,53 @@ mod tests {
         assert_eq!(code, 404);
     }
 
+    fn put_route(name: &str) -> String {
+        let body = format!(r#"{{"upstream":"{name}"}}"#);
+        format!(
+            "PUT /v1/route/default HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn put_route_default_sets_active_route() {
+        let (addr, _dir) = test_server().await;
+        http(addr, &post_upstream("us", "us.example", false)).await;
+
+        let (code, resp) = http(addr, &put_route("us")).await;
+        assert_eq!(code, 200, "got: {resp}");
+        assert!(resp.contains("\"active_route\":\"us\""), "got: {resp}");
+
+        let (_, cfg) = http(
+            addr,
+            "GET /v1/config HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(cfg.contains("\"active_route\":\"us\""), "got: {cfg}");
+    }
+
+    #[tokio::test]
+    async fn put_route_default_unknown_upstream_404() {
+        let (addr, _dir) = test_server().await;
+        let (code, _) = http(addr, &put_route("ghost")).await;
+        assert_eq!(code, 404);
+    }
+
+    #[tokio::test]
+    async fn delete_route_default_clears_active_route() {
+        let (addr, _dir) = test_server().await;
+        http(addr, &post_upstream("us", "us.example", false)).await;
+        http(addr, &put_route("us")).await;
+
+        let (code, resp) = http(
+            addr,
+            "DELETE /v1/route/default HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert!(resp.contains("\"active_route\":null"), "got: {resp}");
+    }
+
     #[tokio::test]
     async fn diff_endpoint_lists_shadows() {
         let (addr, _dir) = test_server().await;
@@ -525,6 +610,7 @@ mod tests {
                 auth: ListenAuth::None,
             },
             upstreams,
+            active_route: None,
         };
         let (store, _rx) = ConfigStore::new(cold, dir.path().join("runic.snapshot.json"));
         let store = Arc::new(Mutex::new(store));

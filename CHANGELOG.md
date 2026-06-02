@@ -40,6 +40,12 @@ Pre-1.0 development; nothing tagged yet. So far runic can:
   kind makes runic connect straight to the requested target instead of relaying
   through a provider — useful for dev/CI smoke tests that shouldn't spend real
   proxy quota. See the Security note: it is off unless explicitly enabled.
+- **Switch the active provider live, by name.** The admin API can point the
+  default (no-provider) route at any upstream in the pool
+  (`PUT /v1/route/default`) without re-sending its credentials, and clear it to
+  fall back to the `default` entry. An operator flips which provider new
+  sessions use on the fly — clients keep talking to the same local port and
+  never see the change.
 - **Reuse the proxy as a library.** The core is published as a library with the
   command-line tool layered on top, so another front-end (for example a desktop
   tray app) can drive the same engine.
