@@ -24,8 +24,19 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use crate::config::UpstreamSpec;
+use crate::config::{SiloAuth, UpstreamSpec};
+use crate::server::SiloPorts;
+use crate::silo::VariationCache;
 use crate::store::ConfigStore;
+
+/// Everything the admin API needs to serve silo requests: the variation cache,
+/// the `none`-mode port registry, and the instance default binding mode.
+#[derive(Clone)]
+pub struct SiloAdmin {
+    pub cache: Arc<Mutex<VariationCache>>,
+    pub ports: Arc<SiloPorts>,
+    pub default_mode: SiloAuth,
+}
 
 const REQUEST_HEAD_LIMIT: usize = 16 * 1024;
 const REQUEST_BODY_LIMIT: usize = 256 * 1024;
@@ -33,7 +44,11 @@ const REQUEST_BODY_LIMIT: usize = 256 * 1024;
 /// Bind the admin listener and spawn its accept loop. Returns the bound address
 /// once the bind succeeds so the caller can fail fast on a port clash (and tests
 /// can target an OS-assigned `:0` port).
-pub async fn spawn(addr: SocketAddr, store: Arc<Mutex<ConfigStore>>) -> Result<SocketAddr> {
+pub async fn spawn(
+    addr: SocketAddr,
+    store: Arc<Mutex<ConfigStore>>,
+    silo: Option<SiloAdmin>,
+) -> Result<SocketAddr> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind admin API on {addr}"))?;
@@ -45,8 +60,9 @@ pub async fn spawn(addr: SocketAddr, store: Arc<Mutex<ConfigStore>>) -> Result<S
             match listener.accept().await {
                 Ok((sock, peer)) => {
                     let store = store.clone();
+                    let silo = silo.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_conn(sock, store, started).await {
+                        if let Err(e) = handle_conn(sock, store, silo, started).await {
                             debug!(%peer, error = %e, "admin connection error");
                         }
                     });
@@ -63,11 +79,14 @@ struct Request {
     path: String,
     query: String,
     body: Vec<u8>,
+    /// Token from an `Authorization: Bearer <token>` header, if present.
+    bearer: Option<String>,
 }
 
 async fn handle_conn(
     mut sock: TcpStream,
     store: Arc<Mutex<ConfigStore>>,
+    silo: Option<SiloAdmin>,
     started: Instant,
 ) -> Result<()> {
     let req = match read_request(&mut sock).await {
@@ -79,7 +98,7 @@ async fn handle_conn(
         }
     };
 
-    let resp = route(&req, &store, started).await;
+    let resp = route(&req, &store, &silo, started).await;
     sock.write_all(&resp)
         .await
         .context("write admin response")?;
@@ -87,7 +106,12 @@ async fn handle_conn(
     Ok(())
 }
 
-async fn route(req: &Request, store: &Arc<Mutex<ConfigStore>>, started: Instant) -> Vec<u8> {
+async fn route(
+    req: &Request,
+    store: &Arc<Mutex<ConfigStore>>,
+    silo: &Option<SiloAdmin>,
+    started: Instant,
+) -> Vec<u8> {
     let permanent = query_flag(&req.query, "permanent");
 
     match (req.method.as_str(), req.path.as_str()) {
@@ -105,6 +129,16 @@ async fn route(req: &Request, store: &Arc<Mutex<ConfigStore>>, started: Instant)
             )
         }
         ("GET", "/v1/config") => {
+            // Silo mode + Bearer ⇒ show that variation's own config (the warm-boot
+            // "is my pool already populated?" check), not the global store.
+            if let (Some(silo), Some(token)) = (silo.as_ref(), req.bearer.as_ref()) {
+                return match silo.cache.lock().await.access(token, unix_now()) {
+                    Ok(data) => json_response(200, "OK", &json!({ "upstreams": data.upstreams })),
+                    Err(_) => {
+                        json_response(404, "Not Found", &json!({ "code": "silo_token_unknown" }))
+                    }
+                };
+            }
             let cfg = store.lock().await.merged();
             json_response(
                 200,
@@ -174,6 +208,7 @@ async fn route(req: &Request, store: &Arc<Mutex<ConfigStore>>, started: Instant)
                 &json!({ "active_route": serde_json::Value::Null }),
             )
         }
+        ("POST", "/v1/silo/open") => silo_open(req, silo).await,
         ("POST", path) if path.starts_with("/v1/upstreams/") => {
             let name = match upstream_name(path) {
                 Some(n) => n,
@@ -201,6 +236,31 @@ async fn route(req: &Request, store: &Arc<Mutex<ConfigStore>>, started: Instant)
                     return json_response(400, "Bad Request", &json!({ "error": e.to_string() }))
                 }
             };
+            // Silo mode + a Bearer token ⇒ write-through into that variation's
+            // encrypted config (the blob *is* the persistence — `?permanent` moot).
+            if let (Some(silo), Some(token)) = (silo.as_ref(), req.bearer.as_ref()) {
+                let now = unix_now();
+                let mut cache = silo.cache.lock().await;
+                let mut data = match cache.access(token, now) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        return json_response(
+                            404,
+                            "Not Found",
+                            &json!({ "code": "silo_token_unknown" }),
+                        )
+                    }
+                };
+                data.upstreams.insert(name.clone(), up);
+                if let Err(e) = cache.write(token, &data, now) {
+                    return json_response(
+                        500,
+                        "Internal Server Error",
+                        &json!({ "error": e.to_string() }),
+                    );
+                }
+                return json_response(200, "OK", &json!({ "name": name, "silo": true }));
+            }
             let mut store = store.lock().await;
             if permanent {
                 if let Err(e) = store.apply_permanent(name.clone(), up) {
@@ -261,6 +321,90 @@ fn persist_error(e: anyhow::Error) -> Vec<u8> {
         "Internal Server Error",
         &json!({ "error": e.to_string() }),
     )
+}
+
+/// `POST /v1/silo/open` — the one silo verb (the "variation" notion stays
+/// internal). No `Authorization` → mint a fresh silo token and return it once.
+/// `Authorization: Bearer <token>` → "patte blanche": confirm the token opens a
+/// live variation; an unknown/purged token gets a **distinct** `404
+/// silo_token_unknown` (never a silent mint — the client re-opens without auth).
+async fn silo_open(req: &Request, silo: &Option<SiloAdmin>) -> Vec<u8> {
+    let Some(silo) = silo else {
+        return json_response(
+            404,
+            "Not Found",
+            &json!({ "error": "silo mode not enabled" }),
+        );
+    };
+    // An optional {"mode":"rfc1929"|"none"} body overrides the instance default.
+    let mode = parse_silo_mode(&req.body).unwrap_or(silo.default_mode);
+    let now = unix_now();
+
+    // No Bearer ⇒ mint a fresh token; Bearer ⇒ use the presented one.
+    let minted = req.bearer.is_none();
+    let token = match &req.bearer {
+        Some(t) => t.clone(),
+        None => match silo.cache.lock().await.create(now) {
+            Ok(t) => t,
+            Err(e) => {
+                return json_response(
+                    500,
+                    "Internal Server Error",
+                    &json!({ "error": e.to_string() }),
+                )
+            }
+        },
+    };
+
+    // Warm the variation (decrypt into RAM). For a Bearer token, an error here is
+    // the deterministic orphan signal — never a silent re-mint.
+    if silo.cache.lock().await.access(&token, now).is_err() {
+        return json_response(404, "Not Found", &json!({ "code": "silo_token_unknown" }));
+    }
+
+    // `none` mode → bind (or reuse) a dedicated no-auth loopback port.
+    let port = if mode == SiloAuth::None {
+        let Some(id) = VariationCache::id_of(&token) else {
+            return json_response(400, "Bad Request", &json!({ "error": "bad token" }));
+        };
+        match silo.ports.ensure(&id).await {
+            Ok(p) => Some(p),
+            Err(e) => {
+                return json_response(
+                    500,
+                    "Internal Server Error",
+                    &json!({ "error": e.to_string() }),
+                )
+            }
+        }
+    } else {
+        None
+    };
+
+    match (minted, port) {
+        (true, Some(p)) => json_response(200, "OK", &json!({ "token": token, "port": p })),
+        (true, None) => json_response(200, "OK", &json!({ "token": token })),
+        (false, Some(p)) => json_response(200, "OK", &json!({ "port": p })),
+        (false, None) => json_response(200, "OK", &json!({ "ok": true })),
+    }
+}
+
+/// Parse an optional `{"mode":"rfc1929"|"none"}` body. `None` ⇒ use the default.
+fn parse_silo_mode(body: &[u8]) -> Option<SiloAuth> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    match v.get("mode")?.as_str()? {
+        "none" => Some(SiloAuth::None),
+        "rfc1929" => Some(SiloAuth::Rfc1929),
+        _ => None,
+    }
+}
+
+/// Current unix time in seconds (the silo clock for create/access/TTL).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Extract the `<name>` from `/v1/upstreams/<name>` (URL-decoded minimally).
@@ -332,10 +476,20 @@ async fn read_request(sock: &mut TcpStream) -> Result<Request> {
     };
 
     let mut content_length = 0usize;
+    let mut bearer = None;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("content-length") {
+            let k = k.trim();
+            if k.eq_ignore_ascii_case("content-length") {
                 content_length = v.trim().parse().unwrap_or(0);
+            } else if k.eq_ignore_ascii_case("authorization") {
+                let v = v.trim();
+                if let Some(tok) = v
+                    .strip_prefix("Bearer ")
+                    .or_else(|| v.strip_prefix("bearer "))
+                {
+                    bearer = Some(tok.trim().to_string());
+                }
             }
         }
     }
@@ -363,6 +517,7 @@ async fn read_request(sock: &mut TcpStream) -> Result<Request> {
         path,
         query,
         body,
+        bearer,
     })
 }
 
@@ -411,11 +566,58 @@ mod tests {
                 let (sock, _) = listener.accept().await.unwrap();
                 let store = store.clone();
                 tokio::spawn(async move {
-                    let _ = handle_conn(sock, store, started).await;
+                    let _ = handle_conn(sock, store, None, started).await;
                 });
             }
         });
         (addr, dir)
+    }
+
+    /// Like [`test_server`] but with silo mode enabled (an empty `VariationCache`).
+    async fn test_server_with_silo(default_mode: SiloAuth) -> (SocketAddr, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cold = Config {
+            listen: Listen {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                auth: ListenAuth::None,
+            },
+            upstreams: BTreeMap::new(),
+            active_route: None,
+        };
+        let (store, cfg_rx) = ConfigStore::new(cold, dir.path().join("runic.snapshot.json"));
+        let store = Arc::new(Mutex::new(store));
+        let cache = Arc::new(Mutex::new(crate::silo::VariationCache::new(
+            crate::silo::SiloStore::open(dir.path().join("runic.silo"), 3600).unwrap(),
+            3600,
+        )));
+        let ports = SiloPorts::new(cfg_rx, cache.clone());
+        let silo = Some(SiloAdmin {
+            cache,
+            ports,
+            default_mode,
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let started = Instant::now();
+        tokio::spawn(async move {
+            loop {
+                let (sock, _) = listener.accept().await.unwrap();
+                let store = store.clone();
+                let silo = silo.clone();
+                tokio::spawn(async move {
+                    let _ = handle_conn(sock, store, silo, started).await;
+                });
+            }
+        });
+        (addr, dir)
+    }
+
+    fn post_silo_open(bearer: Option<&str>) -> String {
+        let auth = bearer
+            .map(|t| format!("Authorization: Bearer {t}\r\n"))
+            .unwrap_or_default();
+        format!("POST /v1/silo/open HTTP/1.1\r\nHost: x\r\n{auth}Connection: close\r\n\r\n")
     }
 
     async fn http(addr: SocketAddr, raw: &str) -> (u16, String) {
@@ -524,6 +726,98 @@ mod tests {
         assert_eq!(code, 404);
     }
 
+    // --- silo open ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn silo_open_mints_token() {
+        let (addr, _d) = test_server_with_silo(SiloAuth::Rfc1929).await;
+        let (code, body) = http(addr, &post_silo_open(None)).await;
+        assert_eq!(code, 200, "got: {body}");
+        assert!(body.contains("\"token\""), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn silo_open_with_valid_token_ok() {
+        let (addr, _d) = test_server_with_silo(SiloAuth::Rfc1929).await;
+        let (_c, minted) = http(addr, &post_silo_open(None)).await;
+        let token = minted
+            .split("\"token\":\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("token in mint response")
+            .to_string();
+
+        let (code, body) = http(addr, &post_silo_open(Some(&token))).await;
+        assert_eq!(code, 200, "got: {body}");
+        assert!(body.contains("\"ok\":true"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn silo_open_unknown_token_is_404_silo_token_unknown() {
+        let (addr, _d) = test_server_with_silo(SiloAuth::Rfc1929).await;
+        let (code, body) = http(addr, &post_silo_open(Some("not-a-real-token"))).await;
+        assert_eq!(code, 404);
+        assert!(body.contains("silo_token_unknown"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn silo_open_404_when_silo_disabled() {
+        let (addr, _d) = test_server().await; // no silo
+        let (code, _) = http(addr, &post_silo_open(None)).await;
+        assert_eq!(code, 404);
+    }
+
+    #[tokio::test]
+    async fn silo_open_none_mode_returns_port_idempotent() {
+        let (addr, _d) = test_server_with_silo(SiloAuth::None).await;
+
+        // Mint in `none` mode → {token, port}.
+        let (code, body) = http(addr, &post_silo_open(None)).await;
+        assert_eq!(code, 200, "got: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let token = v["token"].as_str().expect("token").to_string();
+        let port1 = v["port"].as_u64().expect("port");
+        assert!(port1 > 0);
+
+        // Re-open the same token while warm → the SAME port (idempotent).
+        let (code2, body2) = http(addr, &post_silo_open(Some(&token))).await;
+        assert_eq!(code2, 200, "got: {body2}");
+        let v2: serde_json::Value = serde_json::from_str(&body2).unwrap();
+        assert_eq!(
+            v2["port"].as_u64().expect("port"),
+            port1,
+            "same port while warm"
+        );
+    }
+
+    #[tokio::test]
+    async fn silo_bearer_upstream_writes_through_and_config_shows_it() {
+        let (addr, _d) = test_server_with_silo(SiloAuth::Rfc1929).await;
+        let (_c, body) = http(addr, &post_silo_open(None)).await;
+        let token = serde_json::from_str::<serde_json::Value>(&body).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Push an upstream into *my* variation (Bearer-scoped, write-through).
+        let up = r#"{"kind":"http_connect","host":"v.example","port":823,"auth":{"username":"u","password":"p"}}"#;
+        let raw = format!(
+            "POST /v1/upstreams/default HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{up}",
+            up.len()
+        );
+        let (code, body2) = http(addr, &raw).await;
+        assert_eq!(code, 200, "got: {body2}");
+        assert!(body2.contains("\"silo\":true"), "got: {body2}");
+
+        // GET /v1/config with the same token shows my (now populated) pool.
+        let raw_g = format!(
+            "GET /v1/config HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        );
+        let (code3, cfg) = http(addr, &raw_g).await;
+        assert_eq!(code3, 200);
+        assert!(cfg.contains("v.example"), "got: {cfg}");
+    }
+
     fn put_route(name: &str) -> String {
         let body = format!(r#"{{"upstream":"{name}"}}"#);
         format!(
@@ -615,7 +909,9 @@ mod tests {
         let (store, _rx) = ConfigStore::new(cold, dir.path().join("runic.snapshot.json"));
         let store = Arc::new(Mutex::new(store));
 
-        let addr = spawn("127.0.0.1:0".parse().unwrap(), store).await.unwrap();
+        let addr = spawn("127.0.0.1:0".parse().unwrap(), store, None)
+            .await
+            .unwrap();
         let (code, body) = http(
             addr,
             "GET /v1/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",

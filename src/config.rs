@@ -60,6 +60,39 @@ impl Default for Admin {
     }
 }
 
+/// Per-silo settings (cold YAML `silo:` section). **Opt-in**: when absent or
+/// `enabled: false`, runic runs in plain mode (cleartext snapshot, unchanged).
+/// When enabled, config is kept as encrypted per-variation snapshots (see
+/// [`crate::silo`]).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SiloConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Variation idle TTL, in days; past it the GC purges the variation.
+    #[serde(default = "default_silo_ttl_days")]
+    pub ttl_days: u64,
+    /// How a client binds to its variation.
+    #[serde(default)]
+    pub auth: SiloAuth,
+}
+
+/// Client→variation binding mode for a silo.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SiloAuth {
+    /// Token presented in the SOCKS5 password (RFC 1929). The **default** — works
+    /// with auth-capable clients (curl, SDKs).
+    #[default]
+    Rfc1929,
+    /// No SOCKS5 auth; the client binds to a per-variation loopback port instead
+    /// (for clients like Chromium that don't speak SOCKS5 auth).
+    None,
+}
+
+fn default_silo_ttl_days() -> u64 {
+    7
+}
+
 /// Transport kind for an upstream. `HttpConnect` relays through a gateway (the
 /// production path). `Direct` makes a plain TCP connect straight to the target
 /// — NOT proxied, local IP exposed — gated behind `RUNIC_ALLOW_DIRECT=1`, for
@@ -107,7 +140,11 @@ struct RawFile {
     listen: Listen,
     #[serde(default)]
     admin: Admin,
+    /// Optional so a bare config (e.g. silo mode, configured via the API) parses.
+    #[serde(default)]
     upstreams: BTreeMap<String, UpstreamSpec>,
+    #[serde(default)]
+    silo: Option<SiloConfig>,
 }
 
 /// Wire shape of one upstream entry, shared by the cold YAML loader and the
@@ -225,9 +262,9 @@ impl Config {
         Ok(Self::load_with_admin(path)?.0)
     }
 
-    /// Load the full cold config: the data-plane `Config` plus the boot-time
-    /// `Admin` listener address.
-    pub fn load_with_admin(path: &Path) -> Result<(Self, Admin)> {
+    /// Load the full cold config: the data-plane `Config`, the boot-time `Admin`
+    /// listener address, and the optional `silo` settings.
+    pub fn load_with_admin(path: &Path) -> Result<(Self, Admin, Option<SiloConfig>)> {
         let raw =
             fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
         let file: RawFile =
@@ -252,6 +289,7 @@ impl Config {
                 active_route: None,
             },
             file.admin,
+            file.silo,
         ))
     }
 }
@@ -417,6 +455,38 @@ upstreams:
         let f = write_tmp(yaml);
         let err = Config::load(f.path()).unwrap_err();
         assert!(err.to_string().contains("host"), "got: {err}");
+    }
+
+    #[test]
+    fn parses_silo_config() {
+        let yaml = r#"listen:
+  addr: "127.0.0.1:7777"
+silo:
+  enabled: true
+  ttl_days: 14
+  auth: none
+"#;
+        let f = write_tmp(yaml);
+        let (_cfg, _admin, silo) = Config::load_with_admin(f.path()).unwrap();
+        let silo = silo.expect("silo section present");
+        assert!(silo.enabled);
+        assert_eq!(silo.ttl_days, 14);
+        assert_eq!(silo.auth, SiloAuth::None);
+    }
+
+    #[test]
+    fn silo_absent_is_none_and_defaults_apply() {
+        // Absent silo section → None.
+        let f = write_tmp("listen:\n  addr: \"127.0.0.1:7777\"\nupstreams: {}\n");
+        let (_c, _a, silo) = Config::load_with_admin(f.path()).unwrap();
+        assert!(silo.is_none());
+
+        // Enabled with no auth/ttl given → defaults: 7 days, rfc1929.
+        let f2 = write_tmp("listen:\n  addr: \"127.0.0.1:7777\"\nsilo:\n  enabled: true\n");
+        let (_c2, _a2, silo2) = Config::load_with_admin(f2.path()).unwrap();
+        let s = silo2.unwrap();
+        assert_eq!(s.ttl_days, 7);
+        assert_eq!(s.auth, SiloAuth::Rfc1929);
     }
 
     #[test]

@@ -23,6 +23,23 @@ supported in v0.7:
 Unknown keys are ignored silently to keep the format forward-compatible
 (future versions can add keys without breaking older runic deployments).
 
+## Client compatibility
+
+Username routing needs a SOCKS5 client that actually **sends a username** — i.e.
+one that does RFC 1929 username/password auth. That covers curl, most SDK HTTP
+clients, and CLI tools.
+
+It does **not** cover clients that only speak no-auth SOCKS5 — notably
+Chromium-based browsers, which never offer RFC 1929 auth, so there is no
+username field to carry routing intent. For those, route **out of band**
+instead of in the handshake:
+
+- set the active default route via the admin API
+  (`PUT /v1/route/default {"upstream":"<name>"}`, see
+  [`admin-api.md`](admin-api.md)), or
+- give the client a dedicated loopback port bound to a specific config (see the
+  `none` binding mode in [`silo.md`](silo.md)).
+
 The SOCKS5 password field is **ignored** in v0.7 — it's reserved for v0.8+
 provider-level secret overrides. Send an empty string.
 

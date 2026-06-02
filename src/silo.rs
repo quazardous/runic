@@ -18,7 +18,7 @@
 //! (token in the SOCKS5 auth vs a dedicated loopback port) is a layer above,
 //! configured per silo. Nothing here depends on it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -237,11 +237,23 @@ impl SiloStore {
     /// Purge variations idle past the TTL. Runs **without any token** (operates on
     /// the cleartext index only). Returns the number purged.
     pub fn gc(&mut self, now: u64) -> Result<usize> {
+        self.gc_except(now, &std::collections::HashSet::new())
+    }
+
+    /// Like [`Self::gc`] but never purges a variation whose id is in `protected`
+    /// (e.g. currently warm in a [`VariationCache`] — in active use).
+    pub fn gc_except(
+        &mut self,
+        now: u64,
+        protected: &std::collections::HashSet<String>,
+    ) -> Result<usize> {
         let expired: Vec<String> = self
             .index
             .variations
             .iter()
-            .filter(|(_, e)| now.saturating_sub(e.last_access) > self.ttl_secs)
+            .filter(|(id, e)| {
+                !protected.contains(*id) && now.saturating_sub(e.last_access) > self.ttl_secs
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in &expired {
@@ -252,6 +264,16 @@ impl SiloStore {
             self.persist_index()?;
         }
         Ok(expired.len())
+    }
+
+    /// Stamp a known variation's last-access (no token needed — cleartext index).
+    /// Used when a warm cache entry goes cold, so the disk TTL counts from then.
+    pub fn touch_id(&mut self, id: &str, now: u64) -> Result<()> {
+        if let Some(e) = self.index.variations.get_mut(id) {
+            e.last_access = now;
+            self.persist_index()?;
+        }
+        Ok(())
     }
 
     fn blob_path(&self, id: &str) -> PathBuf {
@@ -301,6 +323,126 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::rename(&tmp, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
+}
+
+/// Idle-evicting RAM cache of decrypted variations over a [`SiloStore`] — the
+/// "keep-alive" layer. A variation is decrypted on first access and kept warm
+/// while in use; once idle past `idle_ttl_secs` it is dropped from RAM (its
+/// plaintext config no longer resides in memory) and its on-disk last-access is
+/// stamped so the disk decay TTL counts from when it went cold.
+pub struct VariationCache {
+    store: SiloStore,
+    warm: HashMap<String, WarmEntry>,
+    idle_ttl_secs: u64,
+}
+
+struct WarmEntry {
+    data: VariationData,
+    last_touch: u64,
+}
+
+impl VariationCache {
+    pub fn new(store: SiloStore, idle_ttl_secs: u64) -> Self {
+        Self {
+            store,
+            warm: HashMap::new(),
+            idle_ttl_secs,
+        }
+    }
+
+    /// Create a new variation; returns its token once (delegates to the store).
+    pub fn create(&mut self, now: u64) -> Result<String> {
+        self.store.create_variation(now)
+    }
+
+    /// Access a variation by token. A warm-cache hit returns the cached config
+    /// (no disk, no re-decrypt); a miss decrypts from disk and warms it.
+    pub fn access(&mut self, token: &str, now: u64) -> Result<VariationData> {
+        let id = variation_id(&decode_token(token)?);
+        if let Some(e) = self.warm.get_mut(&id) {
+            e.last_touch = now;
+            return Ok(e.data.clone());
+        }
+        let data = self.store.open_variation(token, now)?;
+        self.warm.insert(
+            id,
+            WarmEntry {
+                data: data.clone(),
+                last_touch: now,
+            },
+        );
+        Ok(data)
+    }
+
+    /// Persist a variation's data (re-encrypt) and refresh its warm copy.
+    pub fn write(&mut self, token: &str, data: &VariationData, now: u64) -> Result<()> {
+        self.store.write_variation(token, data, now)?;
+        let id = variation_id(&decode_token(token)?);
+        self.warm.insert(
+            id,
+            WarmEntry {
+                data: data.clone(),
+                last_touch: now,
+            },
+        );
+        Ok(())
+    }
+
+    /// Drop variations idle past `idle_ttl_secs` from RAM, stamping their on-disk
+    /// last-access so the disk decay TTL counts from cold. Returns the evicted ids
+    /// (so a caller can tear down anything bound to them, e.g. `none`-mode ports).
+    pub fn evict_idle(&mut self, now: u64) -> Result<Vec<String>> {
+        let cold: Vec<String> = self
+            .warm
+            .iter()
+            .filter(|(_, e)| now.saturating_sub(e.last_touch) > self.idle_ttl_secs)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &cold {
+            self.warm.remove(id);
+            self.store.touch_id(id, now)?;
+        }
+        Ok(cold)
+    }
+
+    /// The decrypted config of a currently-**warm** variation, by id, **without a
+    /// token** (the plaintext is already in RAM). Touches last-access so an
+    /// actively-served `none`-mode port keeps its variation warm. `None` once the
+    /// variation has been evicted.
+    pub fn peek_warm(&mut self, id: &str, now: u64) -> Option<VariationData> {
+        let e = self.warm.get_mut(id)?;
+        e.last_touch = now;
+        Some(e.data.clone())
+    }
+
+    /// The variation id for a token (its `SHA256`), for callers that need to key a
+    /// port/registry by id after an `access`/`create`.
+    pub fn id_of(token: &str) -> Option<String> {
+        decode_token(token).ok().map(|t| variation_id(&t))
+    }
+
+    /// Disk decay GC that never purges a variation currently warm in RAM.
+    pub fn gc(&mut self, now: u64) -> Result<usize> {
+        let protected: HashSet<String> = self.warm.keys().cloned().collect();
+        self.store.gc_except(now, &protected)
+    }
+
+    /// One maintenance pass: evict idle warm entries, then run the disk decay GC.
+    /// Returns `(evicted_ids, purged_count)`. This is what the background sweeper
+    /// calls — the evicted ids let it also tear down their `none`-mode ports.
+    pub fn sweep(&mut self, now: u64) -> Result<(Vec<String>, usize)> {
+        let evicted = self.evict_idle(now)?;
+        let purged = self.gc(now)?;
+        Ok((evicted, purged))
+    }
+
+    pub fn warm_len(&self) -> usize {
+        self.warm.len()
+    }
+
+    pub fn store(&self) -> &SiloStore {
+        &self.store
+    }
 }
 
 #[cfg(test)]
@@ -550,6 +692,83 @@ mod tests {
                 p.display()
             );
         }
+    }
+
+    // --- VariationCache (keep-alive RAM layer) -------------------------------
+
+    fn cache(disk_ttl: u64, idle_ttl: u64) -> (VariationCache, tempfile::TempDir) {
+        let (s, d) = store(disk_ttl);
+        (VariationCache::new(s, idle_ttl), d)
+    }
+
+    #[test]
+    fn cache_access_warms_and_round_trips() {
+        let (mut c, _d) = cache(3600, 3600);
+        let token = c.create(0).unwrap();
+        assert_eq!(c.access(&token, 1).unwrap(), VariationData::default());
+        c.write(&token, &upstream_data("c.example", "u", "p"), 2)
+            .unwrap();
+        assert_eq!(
+            c.access(&token, 3).unwrap().upstreams["default"].host,
+            "c.example"
+        );
+        assert_eq!(c.warm_len(), 1);
+    }
+
+    #[test]
+    fn cache_evicts_idle_then_redecrypts() {
+        let (mut c, _d) = cache(100_000, 100); // big disk TTL, idle TTL = 100
+        let token = c.create(0).unwrap();
+        c.write(&token, &upstream_data("warm.example", "u", "p"), 0)
+            .unwrap();
+        c.access(&token, 0).unwrap();
+        assert_eq!(c.warm_len(), 1);
+
+        assert_eq!(c.evict_idle(50).unwrap().len(), 0, "not idle yet");
+        assert_eq!(c.evict_idle(200).unwrap().len(), 1, "idle past 100s");
+        assert_eq!(c.warm_len(), 0);
+
+        // Re-access re-decrypts from disk — data intact.
+        assert_eq!(
+            c.access(&token, 201).unwrap().upstreams["default"].host,
+            "warm.example"
+        );
+        assert_eq!(c.warm_len(), 1);
+    }
+
+    #[test]
+    fn cache_gc_protects_warm_variations() {
+        let (mut c, _d) = cache(100, 100_000); // disk TTL 100, idle TTL huge
+        let cold = c.create(0).unwrap(); // on disk, never warmed
+        let warm = c.create(0).unwrap();
+        c.access(&warm, 0).unwrap(); // warm it
+
+        // now=200 > disk TTL: the cold variation is purged, the warm one protected.
+        assert_eq!(c.gc(200).unwrap(), 1, "only the cold variation is purged");
+        assert!(
+            c.access(&cold, 201).is_err(),
+            "cold variation should be gone"
+        );
+        assert!(
+            c.access(&warm, 201).is_ok(),
+            "warm variation should survive"
+        );
+    }
+
+    #[test]
+    fn cache_sweep_evicts_idle_and_purges_expired() {
+        let (mut c, _d) = cache(100, 50); // disk TTL 100s, idle TTL 50s
+        let a = c.create(0).unwrap();
+        c.access(&a, 0).unwrap(); // A is warm
+        let b = c.create(0).unwrap(); // B stays cold on disk
+
+        // At t=200: A is idle-evicted from RAM (its disk stamp refreshed to 200,
+        // so it survives the disk GC); B (cold, last_access 0) is purged.
+        let (evicted, purged) = c.sweep(200).unwrap();
+        assert_eq!(evicted.len(), 1, "A evicted from RAM");
+        assert_eq!(purged, 1, "B purged from disk");
+        assert!(c.access(&a, 201).is_ok(), "A survived (was warm at sweep)");
+        assert!(c.access(&b, 201).is_err(), "B was purged");
     }
 
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
