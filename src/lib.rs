@@ -13,6 +13,7 @@ pub mod admin;
 pub mod config;
 pub mod routing;
 pub mod server;
+pub mod silo;
 pub mod store;
 pub mod upstream;
 pub mod watcher;
