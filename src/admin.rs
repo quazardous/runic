@@ -129,6 +129,16 @@ async fn route(
             )
         }
         ("GET", "/v1/config") => {
+            // Silo mode + Bearer ⇒ show that variation's own config (the warm-boot
+            // "is my pool already populated?" check), not the global store.
+            if let (Some(silo), Some(token)) = (silo.as_ref(), req.bearer.as_ref()) {
+                return match silo.cache.lock().await.access(token, unix_now()) {
+                    Ok(data) => json_response(200, "OK", &json!({ "upstreams": data.upstreams })),
+                    Err(_) => {
+                        json_response(404, "Not Found", &json!({ "code": "silo_token_unknown" }))
+                    }
+                };
+            }
             let cfg = store.lock().await.merged();
             json_response(
                 200,
@@ -226,6 +236,31 @@ async fn route(
                     return json_response(400, "Bad Request", &json!({ "error": e.to_string() }))
                 }
             };
+            // Silo mode + a Bearer token ⇒ write-through into that variation's
+            // encrypted config (the blob *is* the persistence — `?permanent` moot).
+            if let (Some(silo), Some(token)) = (silo.as_ref(), req.bearer.as_ref()) {
+                let now = unix_now();
+                let mut cache = silo.cache.lock().await;
+                let mut data = match cache.access(token, now) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        return json_response(
+                            404,
+                            "Not Found",
+                            &json!({ "code": "silo_token_unknown" }),
+                        )
+                    }
+                };
+                data.upstreams.insert(name.clone(), up);
+                if let Err(e) = cache.write(token, &data, now) {
+                    return json_response(
+                        500,
+                        "Internal Server Error",
+                        &json!({ "error": e.to_string() }),
+                    );
+                }
+                return json_response(200, "OK", &json!({ "name": name, "silo": true }));
+            }
             let mut store = store.lock().await;
             if permanent {
                 if let Err(e) = store.apply_permanent(name.clone(), up) {
@@ -753,6 +788,34 @@ mod tests {
             port1,
             "same port while warm"
         );
+    }
+
+    #[tokio::test]
+    async fn silo_bearer_upstream_writes_through_and_config_shows_it() {
+        let (addr, _d) = test_server_with_silo(SiloAuth::Rfc1929).await;
+        let (_c, body) = http(addr, &post_silo_open(None)).await;
+        let token = serde_json::from_str::<serde_json::Value>(&body).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Push an upstream into *my* variation (Bearer-scoped, write-through).
+        let up = r#"{"kind":"http_connect","host":"v.example","port":823,"auth":{"username":"u","password":"p"}}"#;
+        let raw = format!(
+            "POST /v1/upstreams/default HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{up}",
+            up.len()
+        );
+        let (code, body2) = http(addr, &raw).await;
+        assert_eq!(code, 200, "got: {body2}");
+        assert!(body2.contains("\"silo\":true"), "got: {body2}");
+
+        // GET /v1/config with the same token shows my (now populated) pool.
+        let raw_g = format!(
+            "GET /v1/config HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        );
+        let (code3, cfg) = http(addr, &raw_g).await;
+        assert_eq!(code3, 200);
+        assert!(cfg.contains("v.example"), "got: {cfg}");
     }
 
     fn put_route(name: &str) -> String {

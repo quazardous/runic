@@ -1013,6 +1013,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn e2e_silo_none_port_routes_via_variation_no_auth() {
+        use crate::silo::{SiloStore, VariationCache, VariationData};
+
+        let upstream_addr = spawn_mock_upstream(MockBehavior::Echo, "alice", "s3cret").await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(Mutex::new(VariationCache::new(
+            SiloStore::open(dir.path().join("runic.silo"), 3600).unwrap(),
+            3600,
+        )));
+        // Create + populate + warm a variation whose `default` upstream = the mock.
+        let id = {
+            let mut c = cache.lock().await;
+            let token = c.create(0).unwrap();
+            let mut ups = BTreeMap::new();
+            ups.insert(
+                "default".to_string(),
+                Upstream {
+                    kind: UpstreamKind::HttpConnect,
+                    host: upstream_addr.ip().to_string(),
+                    port: upstream_addr.port(),
+                    auth: UpstreamCreds {
+                        username: "alice".into(),
+                        password: "s3cret".into(),
+                    },
+                },
+            );
+            c.write(&token, &VariationData { upstreams: ups }, 0)
+                .unwrap();
+            c.access(&token, 0).unwrap(); // warm it
+            VariationCache::id_of(&token).unwrap()
+        };
+
+        // Empty cold config (the route comes from the variation).
+        let cfg = Config {
+            listen: Listen {
+                addr: pick_free_port(),
+                auth: ListenAuth::None,
+            },
+            upstreams: BTreeMap::new(),
+            active_route: None,
+        };
+        let (_tx, cfg_rx) = watch::channel(Arc::new(cfg));
+        let ports = SiloPorts::new(cfg_rx, cache.clone());
+        let port = ports.ensure(&id).await.unwrap();
+
+        // A NO-AUTH client on the dedicated port routes via the variation.
+        let port_addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let mut tunnel = socks5_connect(port_addr, "any.target.example", 443)
+            .await
+            .expect("no-auth connect on the silo port should route via the variation");
+        let echoed = echo_roundtrip(&mut tunnel, b"none-routed").await.unwrap();
+        assert_eq!(echoed, b"none-routed");
+    }
+
+    #[tokio::test]
     async fn e2e_rebinds_on_listen_addr_change() {
         let upstream_addr = spawn_mock_upstream(MockBehavior::Echo, "u", "p").await;
         let addr1 = pick_free_port();
