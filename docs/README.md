@@ -13,6 +13,8 @@ Feature guides:
   routing via the SOCKS5 username (v0.7+).
 - [`install/admin-api.md`](install/admin-api.md) — Admin API for runtime /
   permanent config changes, firewalld-style (v0.6+).
+- [`install/silo.md`](install/silo.md) — Config silo: encrypted-at-rest,
+  per-client config whose keys never touch the box's disk (opt-in).
 
 Development:
 
