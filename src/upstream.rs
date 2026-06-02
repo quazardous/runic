@@ -4,18 +4,49 @@ use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::config::Upstream;
+use crate::config::{Upstream, UpstreamKind};
 
 const RESPONSE_HEAD_LIMIT: usize = 8 * 1024;
 
-pub async fn connect_via(upstream: &Upstream, target_host: &str, target_port: u16) -> Result<TcpStream> {
+/// Open a connection to `target` for `upstream`, dispatching on its kind:
+/// `HttpConnect` tunnels through the gateway, `Direct` connects straight to the
+/// target (not proxied — see [`crate::config::UpstreamKind::Direct`]).
+pub async fn connect(
+    upstream: &Upstream,
+    target_host: &str,
+    target_port: u16,
+) -> Result<TcpStream> {
+    match upstream.kind {
+        UpstreamKind::HttpConnect => connect_via(upstream, target_host, target_port).await,
+        UpstreamKind::Direct => connect_direct(target_host, target_port).await,
+    }
+}
+
+/// Plain TCP connect straight to the requested target — no gateway, no creds.
+/// The local IP is exposed; only reachable when a `direct` upstream was allowed
+/// via `RUNIC_ALLOW_DIRECT=1` (enforced at config-resolve time).
+pub async fn connect_direct(target_host: &str, target_port: u16) -> Result<TcpStream> {
+    let endpoint = format!("{target_host}:{target_port}");
+    TcpStream::connect(&endpoint)
+        .await
+        .with_context(|| format!("direct connect to {endpoint}"))
+}
+
+pub async fn connect_via(
+    upstream: &Upstream,
+    target_host: &str,
+    target_port: u16,
+) -> Result<TcpStream> {
     let endpoint = format!("{}:{}", upstream.host, upstream.port);
     let mut stream = TcpStream::connect(&endpoint)
         .await
         .with_context(|| format!("dial upstream {endpoint}"))?;
 
     let target = format!("{target_host}:{target_port}");
-    let credential = B64.encode(format!("{}:{}", upstream.auth.username, upstream.auth.password));
+    let credential = B64.encode(format!(
+        "{}:{}",
+        upstream.auth.username, upstream.auth.password
+    ));
 
     let request = format!(
         "CONNECT {target} HTTP/1.1\r\n\
@@ -141,7 +172,10 @@ mod tests {
         let head = b"HTTP/1.1 XYZ Some Reason\r\n\r\n";
         let err = parse_status_line(head).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("XYZ") || msg.contains("unparseable"), "got: {msg}");
+        assert!(
+            msg.contains("XYZ") || msg.contains("unparseable"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -149,7 +183,10 @@ mod tests {
         let head = b"HTTP/1.1 \r\n\r\n";
         // splitn(3, ' ') on "HTTP/1.1 " → ["HTTP/1.1", "", ""], code = "" which fails to parse.
         let err = parse_status_line(head).unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("unparseable"), "got: {err}");
+        assert!(
+            err.to_string().to_lowercase().contains("unparseable"),
+            "got: {err}"
+        );
     }
 
     // connect_via against a mock upstream -----------------------------------
@@ -159,6 +196,7 @@ mod tests {
 
     fn upstream_pointing_at(addr: std::net::SocketAddr, user: &str, pass: &str) -> Upstream {
         Upstream {
+            kind: crate::config::UpstreamKind::HttpConnect,
             host: addr.ip().to_string(),
             port: addr.port(),
             auth: UpstreamCreds {
@@ -184,7 +222,9 @@ mod tests {
         let mock = spawn_mock_upstream(MockBehavior::Echo, "alice", "s3cret").await;
         let up = upstream_pointing_at(mock, "bob", "wrong");
 
-        let err = connect_via(&up, "any.target.example", 443).await.unwrap_err();
+        let err = connect_via(&up, "any.target.example", 443)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("407"), "expected 407 in error: {msg}");
         assert!(
@@ -198,7 +238,9 @@ mod tests {
         let mock = spawn_mock_upstream(MockBehavior::AuthRefused, "", "").await;
         let up = upstream_pointing_at(mock, "anyone", "anything");
 
-        let err = connect_via(&up, "any.target.example", 443).await.unwrap_err();
+        let err = connect_via(&up, "any.target.example", 443)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("407"), "got: {err}");
     }
 
@@ -208,11 +250,48 @@ mod tests {
         let dead = crate::test_helpers::pick_free_port();
         let up = upstream_pointing_at(dead, "u", "p");
 
-        let err = connect_via(&up, "any.target.example", 443).await.unwrap_err();
+        let err = connect_via(&up, "any.target.example", 443)
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("dial upstream") || msg.contains("refused"),
             "expected dial-failure error, got: {msg}"
         );
+    }
+
+    // connect_direct: plain TCP straight to the target, no CONNECT handshake ---
+
+    #[tokio::test]
+    async fn connect_direct_reaches_plain_tcp_target() {
+        // A bare TCP echo server (NOT an HTTP CONNECT proxy) — proves `direct`
+        // bypasses the gateway path entirely.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 16];
+                if let Ok(n) = sock.read(&mut buf).await {
+                    let _ = sock.write_all(&buf[..n]).await;
+                }
+            }
+        });
+
+        let mut stream = connect_direct(&addr.ip().to_string(), addr.port())
+            .await
+            .unwrap();
+        stream.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
+    async fn connect_direct_fails_when_target_unreachable() {
+        let dead = crate::test_helpers::pick_free_port();
+        let err = connect_direct(&dead.ip().to_string(), dead.port())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("direct connect"), "got: {err}");
     }
 }

@@ -108,10 +108,9 @@ upstreams:
         write_yaml(&path, "gw.first.example").expect("write initial");
 
         let initial = Config::load(&path).expect("load initial");
-        assert_eq!(initial.default_upstream().host, "gw.first.example");
+        assert_eq!(initial.default_upstream().unwrap().host, "gw.first.example");
 
-        let (store, mut rx) =
-            ConfigStore::new(initial, dir.path().join("runic.snapshot.json"));
+        let (store, mut rx) = ConfigStore::new(initial, dir.path().join("runic.snapshot.json"));
         let store = Arc::new(Mutex::new(store));
 
         spawn(path.clone(), store.clone()).expect("spawn watcher");
@@ -127,6 +126,9 @@ upstreams:
             .expect("watch channel closed unexpectedly");
 
         let updated = rx.borrow();
-        assert_eq!(updated.default_upstream().host, "gw.second.example");
+        assert_eq!(
+            updated.default_upstream().unwrap().host,
+            "gw.second.example"
+        );
     }
 }

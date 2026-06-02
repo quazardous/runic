@@ -64,6 +64,8 @@ upstreams:
 | `DELETE /v1/upstreams/<name>?permanent=true` | drop hot **and** snapshot; falls back to cold |
 | `POST /v1/snapshot/promote` | firewalld `--runtime-to-permanent`: fold the whole hot layer into the snapshot |
 | `DELETE /v1/snapshot` | wipe the snapshot file; next boot = cold YAML only |
+| `PUT /v1/route/default` | point the default (no-provider) route at a named upstream — body `{"upstream":"<name>"}` (runtime only) |
+| `DELETE /v1/route/default` | clear the pointer; the default route falls back to the `default` entry |
 
 ### Upstream body
 
@@ -98,6 +100,12 @@ curl http://127.0.0.1:7778/v1/diagnose
 
 # See what shadows what
 curl http://127.0.0.1:7778/v1/diff
+
+# Flip the active provider for new sessions, by name (clients don't notice)
+curl -X PUT http://127.0.0.1:7778/v1/route/default \
+  -H 'content-type: application/json' -d '{"upstream":"us-residential"}'
+# ... later, fall back to the `default` entry
+curl -X DELETE http://127.0.0.1:7778/v1/route/default
 
 # Forget all persisted runtime state
 curl -X DELETE http://127.0.0.1:7778/v1/snapshot

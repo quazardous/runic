@@ -36,6 +36,10 @@ In:
 - Multi-provider routing via the SOCKS5 username (v0.7).
 - Admin API for runtime / permanent config changes (v0.6).
 - YAML config with file-watch hot reload (debounced ~100 ms).
+- Empty / `default`-less pool tolerated: runic can boot bare and be configured
+  live via the admin API (unmatched sessions are declined cleanly).
+- `direct` upstream kind for credential-free local/CI runs — **not proxied**
+  (local IP exposed), opt-in only via `RUNIC_ALLOW_DIRECT=1`.
 
 Out (future):
 

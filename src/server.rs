@@ -8,7 +8,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{Config, ListenAuth};
+use crate::config::{Config, ListenAuth, UpstreamKind};
 use crate::upstream;
 
 const SOCKS5_VERSION: u8 = 0x05;
@@ -34,10 +34,11 @@ pub async fn run(mut cfg_rx: watch::Receiver<Arc<Config>>) -> Result<()> {
         .with_context(|| format!("bind SOCKS5 listener on {current_addr}"))?;
     info!(
         addr = %current_addr,
-        upstream_default = %format!("{}:{}", initial.default_upstream().host, initial.default_upstream().port),
+        upstream_default = %default_label(&initial),
         pool_size = initial.upstreams.len(),
         "runic listening"
     );
+    warn_on_direct(&initial);
 
     loop {
         tokio::select! {
@@ -60,7 +61,9 @@ pub async fn run(mut cfg_rx: watch::Receiver<Arc<Config>>) -> Result<()> {
                 if changed.is_err() {
                     return Ok(());
                 }
-                let new_addr = cfg_rx.borrow().listen.addr;
+                let new_cfg = cfg_rx.borrow().clone();
+                warn_on_direct(&new_cfg);
+                let new_addr = new_cfg.listen.addr;
                 if new_addr != current_addr {
                     info!(old = %current_addr, new = %new_addr, "listen addr changed; attempting rebind");
                     match TcpListener::bind(new_addr).await {
@@ -77,6 +80,30 @@ pub async fn run(mut cfg_rx: watch::Receiver<Arc<Config>>) -> Result<()> {
                     debug!("config changed (upstream / auth); future sessions will use new values");
                 }
             }
+        }
+    }
+}
+
+/// Human label for the default route in the boot log: `host:port`, `direct`,
+/// or `<none>` when the pool has no `default` entry (API-driven / empty config).
+fn default_label(cfg: &Config) -> String {
+    match cfg.default_upstream() {
+        None => "<none>".to_string(),
+        Some(u) if u.kind == UpstreamKind::Direct => "direct".to_string(),
+        Some(u) => format!("{}:{}", u.host, u.port),
+    }
+}
+
+/// Loudly flag any active `direct` upstream — it is NOT proxied (the target is
+/// reached over a plain connection with the local IP exposed), only meant for
+/// dev/CI. Emitted at boot and on every config change.
+fn warn_on_direct(cfg: &Config) {
+    for (name, up) in &cfg.upstreams {
+        if up.kind == UpstreamKind::Direct {
+            warn!(
+                upstream = %name,
+                "direct upstream active — traffic NOT proxied (local IP exposed), dev/CI only"
+            );
         }
     }
 }
@@ -105,9 +132,24 @@ async fn serve(mut client: TcpStream, cfg: &Config) -> Result<()> {
     // V0.7 routing — pick upstream based on negotiated SOCKS5 username, fall
     // back to `default` for no-auth clients or unrecognised provider names.
     let socks5_user = creds.as_ref().map(|c| c.username.as_str());
-    let chosen_upstream = crate::routing::pick_upstream(cfg, socks5_user);
+    let chosen_upstream = match crate::routing::pick_upstream(cfg, socks5_user) {
+        Some(u) => u,
+        None => {
+            // No matching route: empty pool, unknown provider, or no `default`.
+            // Fail the session cleanly rather than panicking — this is the normal
+            // state for an API-driven runic before any route has been pushed.
+            warn!(
+                %host,
+                port,
+                socks5_user = socks5_user.unwrap_or(""),
+                "no route for session — refusing CONNECT"
+            );
+            reply(&mut client, REPLY_GENERAL_FAILURE).await?;
+            return Ok(());
+        }
+    };
 
-    let mut upstream_stream = match upstream::connect_via(chosen_upstream, &host, port).await {
+    let mut upstream_stream = match upstream::connect(chosen_upstream, &host, port).await {
         Ok(s) => s,
         Err(e) => {
             warn!(%host, port, error = %e, "upstream connect failed");
@@ -120,7 +162,11 @@ async fn serve(mut client: TcpStream, cfg: &Config) -> Result<()> {
 
     match copy_bidirectional(&mut client, &mut upstream_stream).await {
         Ok((c_to_u, u_to_c)) => debug!(%host, port, c_to_u, u_to_c, "session closed"),
-        Err(e) if matches!(e.kind(), io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe
+            ) => {}
         Err(e) => warn!(%host, port, ?e, "pump error"),
     }
     Ok(())
@@ -137,7 +183,10 @@ async fn negotiate_method<S: AsyncRead + AsyncWrite + Unpin>(
     }
     let nmethods = hdr[1] as usize;
     let mut methods = vec![0u8; nmethods];
-    client.read_exact(&mut methods).await.context("read methods")?;
+    client
+        .read_exact(&mut methods)
+        .await
+        .context("read methods")?;
 
     // V0.7 preference: METHOD_USERPASS (0x02) > METHOD_NO_AUTH (0x00). When the
     // client offers user/pass we always take it — the username carries the
@@ -161,7 +210,10 @@ async fn negotiate_method<S: AsyncRead + AsyncWrite + Unpin>(
         METHOD_NO_AUTH => Ok(None),
         METHOD_USERPASS => Ok(Some(parse_userpass_auth(client).await?)),
         METHOD_NO_ACCEPTABLE => {
-            bail!("client offered no acceptable auth method (offered: {:?})", methods)
+            bail!(
+                "client offered no acceptable auth method (offered: {:?})",
+                methods
+            )
         }
         _ => unreachable!("chosen byte set above"),
     }
@@ -174,18 +226,30 @@ async fn parse_userpass_auth<S: AsyncRead + AsyncWrite + Unpin>(
     client: &mut S,
 ) -> Result<UserPass> {
     let mut hdr = [0u8; 2];
-    client.read_exact(&mut hdr).await.context("read userpass greeting")?;
+    client
+        .read_exact(&mut hdr)
+        .await
+        .context("read userpass greeting")?;
     if hdr[0] != USERPASS_VERSION {
         bail!("userpass auth: bad version 0x{:02x}", hdr[0]);
     }
     let ulen = hdr[1] as usize;
     let mut username = vec![0u8; ulen];
-    client.read_exact(&mut username).await.context("read username")?;
+    client
+        .read_exact(&mut username)
+        .await
+        .context("read username")?;
     let mut plen_buf = [0u8; 1];
-    client.read_exact(&mut plen_buf).await.context("read plen")?;
+    client
+        .read_exact(&mut plen_buf)
+        .await
+        .context("read plen")?;
     let plen = plen_buf[0] as usize;
     let mut password = vec![0u8; plen];
-    client.read_exact(&mut password).await.context("read password")?;
+    client
+        .read_exact(&mut password)
+        .await
+        .context("read password")?;
 
     // Reply success — we never reject on creds shape; that's the routing layer's
     // call (and even there, unrecognised provider just falls back to default).
@@ -200,11 +264,12 @@ async fn parse_userpass_auth<S: AsyncRead + AsyncWrite + Unpin>(
     })
 }
 
-async fn parse_request<S: AsyncRead + AsyncWrite + Unpin>(
-    client: &mut S,
-) -> Result<(String, u16)> {
+async fn parse_request<S: AsyncRead + AsyncWrite + Unpin>(client: &mut S) -> Result<(String, u16)> {
     let mut hdr = [0u8; 4];
-    client.read_exact(&mut hdr).await.context("read request header")?;
+    client
+        .read_exact(&mut hdr)
+        .await
+        .context("read request header")?;
     if hdr[0] != SOCKS5_VERSION {
         bail!("request: bad version 0x{:02x}", hdr[0]);
     }
@@ -270,7 +335,9 @@ mod tests {
         // Client greeting: ver=5, nmethods=1, methods=[0x00 no-auth]
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
 
-        let creds = negotiate_method(&mut server, &ListenAuth::None).await.unwrap();
+        let creds = negotiate_method(&mut server, &ListenAuth::None)
+            .await
+            .unwrap();
         assert!(creds.is_none(), "no-auth path must not yield UserPass");
 
         let mut reply = [0u8; 2];
@@ -288,13 +355,15 @@ mod tests {
             .write_all(&[
                 0x01, // userpass version
                 0x10, // ulen = 16
-                b'p', b'r', b'o', b'v', b'i', b'd', b'e', b'r', b'=', b'u', b's', b'-', b'f', b'o', b'o', b';',
-                0x00, // plen = 0 (no password — V0.7 ignores it anyway)
+                b'p', b'r', b'o', b'v', b'i', b'd', b'e', b'r', b'=', b'u', b's', b'-', b'f', b'o',
+                b'o', b';', 0x00, // plen = 0 (no password — V0.7 ignores it anyway)
             ])
             .await
             .unwrap();
 
-        let creds = negotiate_method(&mut server, &ListenAuth::None).await.unwrap();
+        let creds = negotiate_method(&mut server, &ListenAuth::None)
+            .await
+            .unwrap();
         let creds = creds.expect("server should yield UserPass when 0x02 was negotiated");
         assert_eq!(creds.username, "provider=us-foo;");
         assert_eq!(creds.password, "");
@@ -315,9 +384,14 @@ mod tests {
         // Client greeting offers ONLY userpass (0x02).
         client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
         // Send minimal userpass: u="x" p="y".
-        client.write_all(&[0x01, 0x01, b'x', 0x01, b'y']).await.unwrap();
+        client
+            .write_all(&[0x01, 0x01, b'x', 0x01, b'y'])
+            .await
+            .unwrap();
 
-        let creds = negotiate_method(&mut server, &ListenAuth::None).await.unwrap();
+        let creds = negotiate_method(&mut server, &ListenAuth::None)
+            .await
+            .unwrap();
         let creds = creds.expect("UserPass expected");
         assert_eq!(creds.username, "x");
         assert_eq!(creds.password, "y");
@@ -421,10 +495,7 @@ mod tests {
     async fn parse_request_rejects_atyp_unknown_with_reply() {
         let (mut client, mut server) = duplex(64);
         // CMD=CONNECT, ATYP=0x99 (invalid).
-        client
-            .write_all(&[0x05, 0x01, 0x00, 0x99])
-            .await
-            .unwrap();
+        client.write_all(&[0x05, 0x01, 0x00, 0x99]).await.unwrap();
 
         let err = parse_request(&mut server).await.unwrap_err();
         assert!(err.to_string().contains("0x99"), "got: {err}");
@@ -451,7 +522,7 @@ mod tests {
     // ------------------------------------------------------------------------
 
     use crate::config::{
-        Listen, ListenAuth, Upstream, UpstreamCreds, DEFAULT_UPSTREAM_NAME,
+        Listen, ListenAuth, Upstream, UpstreamCreds, UpstreamKind, DEFAULT_UPSTREAM_NAME,
     };
     use crate::test_helpers::{
         echo_roundtrip, pick_free_port, socks5_connect, socks5_connect_capture_code,
@@ -460,11 +531,17 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    fn cfg_for(listen_addr: std::net::SocketAddr, upstream_addr: std::net::SocketAddr, user: &str, pass: &str) -> Config {
+    fn cfg_for(
+        listen_addr: std::net::SocketAddr,
+        upstream_addr: std::net::SocketAddr,
+        user: &str,
+        pass: &str,
+    ) -> Config {
         let mut upstreams = BTreeMap::new();
         upstreams.insert(
             DEFAULT_UPSTREAM_NAME.to_string(),
             Upstream {
+                kind: UpstreamKind::HttpConnect,
                 host: upstream_addr.ip().to_string(),
                 port: upstream_addr.port(),
                 auth: UpstreamCreds {
@@ -479,6 +556,7 @@ mod tests {
                 auth: ListenAuth::None,
             },
             upstreams,
+            active_route: None,
         }
     }
 
@@ -494,8 +572,7 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_socks5_through_runic_to_upstream_echoes() {
-        let upstream_addr =
-            spawn_mock_upstream(MockBehavior::Echo, "alice", "s3cret").await;
+        let upstream_addr = spawn_mock_upstream(MockBehavior::Echo, "alice", "s3cret").await;
         let listen_addr = pick_free_port();
         let cfg = cfg_for(listen_addr, upstream_addr, "alice", "s3cret");
         let (_tx, rx) = watch::channel(Arc::new(cfg));
@@ -516,8 +593,7 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_upstream_407_surfaces_as_socks5_general_failure() {
-        let upstream_addr =
-            spawn_mock_upstream(MockBehavior::AuthRefused, "", "").await;
+        let upstream_addr = spawn_mock_upstream(MockBehavior::AuthRefused, "", "").await;
         let listen_addr = pick_free_port();
         let cfg = cfg_for(listen_addr, upstream_addr, "anyone", "ignored");
         let (_tx, rx) = watch::channel(Arc::new(cfg));
@@ -551,6 +627,7 @@ mod tests {
         upstreams.insert(
             DEFAULT_UPSTREAM_NAME.to_string(),
             Upstream {
+                kind: UpstreamKind::HttpConnect,
                 host: default_up.ip().to_string(),
                 port: default_up.port(),
                 auth: UpstreamCreds {
@@ -562,6 +639,7 @@ mod tests {
         upstreams.insert(
             named.to_string(),
             Upstream {
+                kind: UpstreamKind::HttpConnect,
                 host: named_up.ip().to_string(),
                 port: named_up.port(),
                 auth: UpstreamCreds {
@@ -571,8 +649,12 @@ mod tests {
             },
         );
         Config {
-            listen: Listen { addr: listen_addr, auth: ListenAuth::None },
+            listen: Listen {
+                addr: listen_addr,
+                auth: ListenAuth::None,
+            },
             upstreams,
+            active_route: None,
         }
     }
 
@@ -581,20 +663,24 @@ mod tests {
         // Two mock upstreams with DIFFERENT expected credentials. Routing must
         // pick the upstream whose creds match — if routing routed wrongly, the
         // wrong mock would respond 407 NO_USER and CONNECT would fail.
-        let upstream_default =
-            spawn_mock_upstream(MockBehavior::Echo, "alice", "a-secret").await;
-        let upstream_us =
-            spawn_mock_upstream(MockBehavior::Echo, "bob", "b-secret").await;
+        let upstream_default = spawn_mock_upstream(MockBehavior::Echo, "alice", "a-secret").await;
+        let upstream_us = spawn_mock_upstream(MockBehavior::Echo, "bob", "b-secret").await;
 
         let listen_addr = pick_free_port();
         let cfg = cfg_for_two_upstreams(
             listen_addr,
-            upstream_default, "alice", "a-secret",
+            upstream_default,
+            "alice",
+            "a-secret",
             "us-residential",
-            upstream_us, "bob", "b-secret",
+            upstream_us,
+            "bob",
+            "b-secret",
         );
         let (_tx, rx) = watch::channel(Arc::new(cfg));
-        tokio::spawn(async move { let _ = run(rx).await; });
+        tokio::spawn(async move {
+            let _ = run(rx).await;
+        });
         wait_until_listening(listen_addr).await;
 
         // Client signals routing intent `provider=us-residential` via SOCKS5 user.
@@ -616,20 +702,24 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_userpass_empty_provider_falls_back_to_default() {
-        let upstream_default =
-            spawn_mock_upstream(MockBehavior::Echo, "alice", "a-secret").await;
-        let upstream_us =
-            spawn_mock_upstream(MockBehavior::Echo, "bob", "b-secret").await;
+        let upstream_default = spawn_mock_upstream(MockBehavior::Echo, "alice", "a-secret").await;
+        let upstream_us = spawn_mock_upstream(MockBehavior::Echo, "bob", "b-secret").await;
 
         let listen_addr = pick_free_port();
         let cfg = cfg_for_two_upstreams(
             listen_addr,
-            upstream_default, "alice", "a-secret",
+            upstream_default,
+            "alice",
+            "a-secret",
             "us-residential",
-            upstream_us, "bob", "b-secret",
+            upstream_us,
+            "bob",
+            "b-secret",
         );
         let (_tx, rx) = watch::channel(Arc::new(cfg));
-        tokio::spawn(async move { let _ = run(rx).await; });
+        tokio::spawn(async move {
+            let _ = run(rx).await;
+        });
         wait_until_listening(listen_addr).await;
 
         // SOCKS5 user does not specify provider — routing should land on default.
@@ -650,34 +740,39 @@ mod tests {
     #[tokio::test]
     async fn e2e_no_auth_client_still_routes_to_default() {
         // V0.7 must remain backwards-compat with no-auth (METHOD 0x00) clients.
-        let upstream_default =
-            spawn_mock_upstream(MockBehavior::Echo, "alice", "a-secret").await;
-        let upstream_us =
-            spawn_mock_upstream(MockBehavior::AuthRefused, "", "").await;
+        let upstream_default = spawn_mock_upstream(MockBehavior::Echo, "alice", "a-secret").await;
+        let upstream_us = spawn_mock_upstream(MockBehavior::AuthRefused, "", "").await;
 
         let listen_addr = pick_free_port();
         let cfg = cfg_for_two_upstreams(
             listen_addr,
-            upstream_default, "alice", "a-secret",
+            upstream_default,
+            "alice",
+            "a-secret",
             "us-residential",
-            upstream_us, "bob", "b-secret",
+            upstream_us,
+            "bob",
+            "b-secret",
         );
         let (_tx, rx) = watch::channel(Arc::new(cfg));
-        tokio::spawn(async move { let _ = run(rx).await; });
+        tokio::spawn(async move {
+            let _ = run(rx).await;
+        });
         wait_until_listening(listen_addr).await;
 
         let mut tunnel = socks5_connect(listen_addr, "any.target.example", 443)
             .await
             .expect("legacy no-auth client should still route to default");
 
-        let echoed = echo_roundtrip(&mut tunnel, b"legacy-no-auth").await.unwrap();
+        let echoed = echo_roundtrip(&mut tunnel, b"legacy-no-auth")
+            .await
+            .unwrap();
         assert_eq!(echoed, b"legacy-no-auth");
     }
 
     #[tokio::test]
     async fn e2e_rebinds_on_listen_addr_change() {
-        let upstream_addr =
-            spawn_mock_upstream(MockBehavior::Echo, "u", "p").await;
+        let upstream_addr = spawn_mock_upstream(MockBehavior::Echo, "u", "p").await;
         let addr1 = pick_free_port();
         let addr2 = pick_free_port();
         let cfg1 = cfg_for(addr1, upstream_addr, "u", "p");
@@ -696,8 +791,7 @@ mod tests {
 
         // Push a new config with addr2 — server should drop its addr1 listener
         // and rebind on addr2.
-        let upstream2 =
-            spawn_mock_upstream(MockBehavior::Echo, "u", "p").await;
+        let upstream2 = spawn_mock_upstream(MockBehavior::Echo, "u", "p").await;
         let cfg2 = cfg_for(addr2, upstream2, "u", "p");
         tx.send(Arc::new(cfg2)).unwrap();
         wait_until_listening(addr2).await;
@@ -708,6 +802,9 @@ mod tests {
 
         // And addr1 should now refuse — listener was dropped.
         let dial_old = tokio::net::TcpStream::connect(addr1).await;
-        assert!(dial_old.is_err(), "addr1 should no longer accept after rebind");
+        assert!(
+            dial_old.is_err(),
+            "addr1 should no longer accept after rebind"
+        );
     }
 }

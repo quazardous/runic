@@ -67,6 +67,9 @@ pub struct ConfigStore {
     cold: Arc<Config>,
     snapshot: BTreeMap<String, Upstream>,
     hot: BTreeMap<String, Upstream>,
+    /// Active-route pointer (admin `PUT /v1/route/default`). Runtime only — not
+    /// persisted to the snapshot. `None` falls back to the `default` entry.
+    active_route: Option<String>,
     snapshot_path: PathBuf,
     cfg_tx: watch::Sender<Arc<Config>>,
 }
@@ -87,12 +90,14 @@ impl ConfigStore {
             }
         };
         let hot = BTreeMap::new();
-        let merged = merge(&cold, &snapshot, &hot);
+        let active_route: Option<String> = None;
+        let merged = merge(&cold, &snapshot, &hot, &active_route);
         let (cfg_tx, cfg_rx) = watch::channel(Arc::new(merged));
         let store = Self {
             cold: Arc::new(cold),
             snapshot,
             hot,
+            active_route,
             snapshot_path,
             cfg_tx,
         };
@@ -101,7 +106,7 @@ impl ConfigStore {
 
     /// Rebuild the merged config and broadcast it. The one apply path.
     fn publish(&self) {
-        let merged = merge(&self.cold, &self.snapshot, &self.hot);
+        let merged = merge(&self.cold, &self.snapshot, &self.hot, &self.active_route);
         // send_replace ignores the "no receivers" case — the data plane may not
         // be up yet during boot, and that's fine.
         let _ = self.cfg_tx.send(Arc::new(merged));
@@ -171,9 +176,8 @@ impl ConfigStore {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("remove snapshot {}", self.snapshot_path.display())
-                });
+                return Err(e)
+                    .with_context(|| format!("remove snapshot {}", self.snapshot_path.display()));
             }
         }
         self.publish();
@@ -240,7 +244,20 @@ impl ConfigStore {
 
     /// The merged effective config (`/v1/config`).
     pub fn merged(&self) -> Config {
-        merge(&self.cold, &self.snapshot, &self.hot)
+        merge(&self.cold, &self.snapshot, &self.hot, &self.active_route)
+    }
+
+    /// Set (or clear with `None`) the active-route pointer and republish.
+    /// Runtime only — not persisted to the snapshot. `None` falls back to the
+    /// entry named `default`.
+    pub fn set_active_route(&mut self, route: Option<String>) {
+        self.active_route = route;
+        self.publish();
+    }
+
+    /// The current active-route pointer, if set.
+    pub fn active_route(&self) -> Option<&str> {
+        self.active_route.as_deref()
     }
 
     pub fn pool_size(&self) -> usize {
@@ -281,6 +298,7 @@ fn merge(
     cold: &Config,
     snapshot: &BTreeMap<String, Upstream>,
     hot: &BTreeMap<String, Upstream>,
+    active_route: &Option<String>,
 ) -> Config {
     let mut upstreams = cold.upstreams.clone();
     for (k, v) in snapshot {
@@ -292,6 +310,7 @@ fn merge(
     Config {
         listen: cold.listen.clone(),
         upstreams,
+        active_route: active_route.clone(),
     }
 }
 
@@ -366,11 +385,12 @@ fn write_snapshot(path: &Path, upstreams: &BTreeMap<String, Upstream>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Listen, ListenAuth, UpstreamCreds};
+    use crate::config::{Listen, ListenAuth, UpstreamCreds, UpstreamKind};
     use std::net::SocketAddr;
 
     fn up(host: &str) -> Upstream {
         Upstream {
+            kind: UpstreamKind::HttpConnect,
             host: host.to_string(),
             port: 823,
             auth: UpstreamCreds {
@@ -391,10 +411,14 @@ mod tests {
                 auth: ListenAuth::None,
             },
             upstreams,
+            active_route: None,
         }
     }
 
-    fn store_with(cold: Config, dir: &tempfile::TempDir) -> (ConfigStore, watch::Receiver<Arc<Config>>) {
+    fn store_with(
+        cold: Config,
+        dir: &tempfile::TempDir,
+    ) -> (ConfigStore, watch::Receiver<Arc<Config>>) {
         let path = dir.path().join("runic.snapshot.json");
         ConfigStore::new(cold, path)
     }
@@ -477,8 +501,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut store, _rx) = store_with(cold_with(&[("default", "cold.example")]), &dir);
 
-        store.apply_permanent("us".into(), up("first.example")).unwrap();
-        store.apply_permanent("us".into(), up("second.example")).unwrap();
+        store
+            .apply_permanent("us".into(), up("first.example"))
+            .unwrap();
+        store
+            .apply_permanent("us".into(), up("second.example"))
+            .unwrap();
 
         let (reloaded, _rx2) = store_with(cold_with(&[("default", "cold.example")]), &dir);
         // No history — only the last value survives.
@@ -491,7 +519,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut store, _rx) = store_with(cold_with(&[("default", "cold.example")]), &dir);
 
-        store.apply_permanent("us".into(), up("snap.example")).unwrap();
+        store
+            .apply_permanent("us".into(), up("snap.example"))
+            .unwrap();
         store.apply_runtime("us".into(), up("hot.example"));
         assert_eq!(store.diagnose()["us"], Source::Hot);
 

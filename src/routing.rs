@@ -49,25 +49,44 @@ pub fn parse_routing_spec(socks5_user: Option<&str>) -> RoutingSpec {
     spec
 }
 
-/// Resolve the upstream that should serve this session. Picks the named
-/// `provider` from the pool when present, otherwise falls back to `default`.
-/// `default` is always present in a valid `Config` (validated at load time).
-pub fn pick_upstream<'a>(cfg: &'a Config, socks5_user: Option<&str>) -> &'a Upstream {
+/// Resolve the upstream that should serve this session. Precedence:
+///
+/// 1. the session's explicit `provider=…` (client's choice always wins);
+/// 2. the admin-settable active-route pointer (`cfg.active_route`);
+/// 3. the entry literally named `default`.
+///
+/// Returns `None` when none resolves — a valid state (empty / default-less
+/// pool): the caller fails the session cleanly rather than connecting.
+pub fn pick_upstream<'a>(cfg: &'a Config, socks5_user: Option<&str>) -> Option<&'a Upstream> {
     let spec = parse_routing_spec(socks5_user);
-    spec.provider
+    if let Some(up) = spec
+        .provider
         .as_ref()
         .and_then(|name| cfg.upstreams.get(name))
-        .unwrap_or_else(|| cfg.default_upstream())
+    {
+        return Some(up);
+    }
+    if let Some(up) = cfg
+        .active_route
+        .as_ref()
+        .and_then(|name| cfg.upstreams.get(name))
+    {
+        return Some(up);
+    }
+    cfg.default_upstream()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Listen, ListenAuth, Upstream, UpstreamCreds, DEFAULT_UPSTREAM_NAME};
+    use crate::config::{
+        Listen, ListenAuth, Upstream, UpstreamCreds, UpstreamKind, DEFAULT_UPSTREAM_NAME,
+    };
     use std::collections::BTreeMap;
 
     fn upstream_with_host(host: &str) -> Upstream {
         Upstream {
+            kind: UpstreamKind::HttpConnect,
             host: host.to_string(),
             port: 823,
             auth: UpstreamCreds {
@@ -92,6 +111,7 @@ mod tests {
                 auth: ListenAuth::None,
             },
             upstreams,
+            active_route: None,
         }
     }
 
@@ -134,32 +154,102 @@ mod tests {
 
     // pick_upstream -----------------------------------------------------------
 
+    fn cfg_without_default(entries: &[(&str, &str)]) -> Config {
+        let mut upstreams = BTreeMap::new();
+        for (name, host) in entries {
+            upstreams.insert((*name).to_string(), upstream_with_host(host));
+        }
+        Config {
+            listen: Listen {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                auth: ListenAuth::None,
+            },
+            upstreams,
+            active_route: None,
+        }
+    }
+
     #[test]
     fn picks_named_provider_when_present() {
         let cfg = cfg_with("gw-default.example", &[("us-residential", "gw-us.example")]);
-        let up = pick_upstream(&cfg, Some("provider=us-residential"));
+        let up = pick_upstream(&cfg, Some("provider=us-residential")).unwrap();
         assert_eq!(up.host, "gw-us.example");
     }
 
     #[test]
     fn falls_back_to_default_when_provider_missing_from_pool() {
         let cfg = cfg_with("gw-default.example", &[]);
-        let up = pick_upstream(&cfg, Some("provider=does-not-exist"));
+        let up = pick_upstream(&cfg, Some("provider=does-not-exist")).unwrap();
         assert_eq!(up.host, "gw-default.example");
     }
 
     #[test]
     fn falls_back_to_default_when_user_empty() {
         let cfg = cfg_with("gw-default.example", &[]);
-        assert_eq!(pick_upstream(&cfg, None).host, "gw-default.example");
-        assert_eq!(pick_upstream(&cfg, Some("")).host, "gw-default.example");
+        assert_eq!(
+            pick_upstream(&cfg, None).unwrap().host,
+            "gw-default.example"
+        );
+        assert_eq!(
+            pick_upstream(&cfg, Some("")).unwrap().host,
+            "gw-default.example"
+        );
     }
 
     #[test]
     fn falls_back_to_default_on_malformed_spec() {
         let cfg = cfg_with("gw-default.example", &[("us", "gw-us.example")]);
         // No `provider=` key at all → should land on default, not us.
-        assert_eq!(pick_upstream(&cfg, Some("sessid=xyz")).host, "gw-default.example");
-        assert_eq!(pick_upstream(&cfg, Some("=junk")).host, "gw-default.example");
+        assert_eq!(
+            pick_upstream(&cfg, Some("sessid=xyz")).unwrap().host,
+            "gw-default.example"
+        );
+        assert_eq!(
+            pick_upstream(&cfg, Some("=junk")).unwrap().host,
+            "gw-default.example"
+        );
+    }
+
+    #[test]
+    fn active_route_pointer_overrides_default() {
+        let mut cfg = cfg_with("gw-default.example", &[("us", "gw-us.example")]);
+        cfg.active_route = Some("us".to_string());
+
+        // No provider → follows the active-route pointer, not the `default` entry.
+        assert_eq!(pick_upstream(&cfg, None).unwrap().host, "gw-us.example");
+
+        // An explicit provider still wins over the pointer.
+        assert_eq!(
+            pick_upstream(&cfg, Some("provider=default")).unwrap().host,
+            "gw-default.example"
+        );
+
+        // Pointer aimed at a missing name → falls back to the `default` entry.
+        cfg.active_route = Some("ghost".to_string());
+        assert_eq!(
+            pick_upstream(&cfg, None).unwrap().host,
+            "gw-default.example"
+        );
+    }
+
+    #[test]
+    fn no_route_when_no_default_and_no_match() {
+        // Empty pool → no route at all.
+        let empty = cfg_without_default(&[]);
+        assert!(pick_upstream(&empty, None).is_none());
+        assert!(pick_upstream(&empty, Some("provider=whatever")).is_none());
+
+        // Pool without `default`: an unknown / unspecified provider has nowhere
+        // to fall back to → None (the session is refused cleanly upstream).
+        let no_default = cfg_without_default(&[("us", "gw-us.example")]);
+        assert!(pick_upstream(&no_default, None).is_none());
+        assert!(pick_upstream(&no_default, Some("provider=does-not-exist")).is_none());
+        // But a matching named provider still resolves.
+        assert_eq!(
+            pick_upstream(&no_default, Some("provider=us"))
+                .unwrap()
+                .host,
+            "gw-us.example"
+        );
     }
 }

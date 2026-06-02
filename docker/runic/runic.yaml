@@ -8,6 +8,10 @@
 # `upstreams` is a pool keyed by name. Clients pick an upstream per session via
 # the SOCKS5 username (v0.7, see docs/install/socks5-routing.md); traffic with no
 # routing intent falls back to the entry named `default`.
+#
+# The pool may also be left empty: runic boots with no providers and is then
+# configured entirely over the admin API (sessions are declined cleanly until a
+# route exists). A session with no matching upstream and no `default` is refused.
 
 listen:
   addr: "0.0.0.0:7777"
@@ -41,3 +45,11 @@ upstreams:
   #   auth:
   #     username_env: USRES_LOGIN
   #     password_env: USRES_PASSWORD
+
+  # `direct` upstream — NOT proxied: runic TCP-connects straight to the target
+  # with the local IP exposed. For dev/CI only (exercise the SOCKS5 path without
+  # provider credentials). Fail-closed: requires the env var RUNIC_ALLOW_DIRECT=1,
+  # otherwise runic refuses to start. host/port/auth are not needed for `direct`.
+  #
+  # direct:
+  #   kind: direct
