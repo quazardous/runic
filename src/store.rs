@@ -171,9 +171,8 @@ impl ConfigStore {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("remove snapshot {}", self.snapshot_path.display())
-                });
+                return Err(e)
+                    .with_context(|| format!("remove snapshot {}", self.snapshot_path.display()));
             }
         }
         self.publish();
@@ -366,11 +365,12 @@ fn write_snapshot(path: &Path, upstreams: &BTreeMap<String, Upstream>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Listen, ListenAuth, UpstreamCreds};
+    use crate::config::{Listen, ListenAuth, UpstreamCreds, UpstreamKind};
     use std::net::SocketAddr;
 
     fn up(host: &str) -> Upstream {
         Upstream {
+            kind: UpstreamKind::HttpConnect,
             host: host.to_string(),
             port: 823,
             auth: UpstreamCreds {
@@ -394,7 +394,10 @@ mod tests {
         }
     }
 
-    fn store_with(cold: Config, dir: &tempfile::TempDir) -> (ConfigStore, watch::Receiver<Arc<Config>>) {
+    fn store_with(
+        cold: Config,
+        dir: &tempfile::TempDir,
+    ) -> (ConfigStore, watch::Receiver<Arc<Config>>) {
         let path = dir.path().join("runic.snapshot.json");
         ConfigStore::new(cold, path)
     }
@@ -477,8 +480,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut store, _rx) = store_with(cold_with(&[("default", "cold.example")]), &dir);
 
-        store.apply_permanent("us".into(), up("first.example")).unwrap();
-        store.apply_permanent("us".into(), up("second.example")).unwrap();
+        store
+            .apply_permanent("us".into(), up("first.example"))
+            .unwrap();
+        store
+            .apply_permanent("us".into(), up("second.example"))
+            .unwrap();
 
         let (reloaded, _rx2) = store_with(cold_with(&[("default", "cold.example")]), &dir);
         // No history — only the last value survives.
@@ -491,7 +498,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut store, _rx) = store_with(cold_with(&[("default", "cold.example")]), &dir);
 
-        store.apply_permanent("us".into(), up("snap.example")).unwrap();
+        store
+            .apply_permanent("us".into(), up("snap.example"))
+            .unwrap();
         store.apply_runtime("us".into(), up("hot.example"));
         assert_eq!(store.diagnose()["us"], Source::Hot);
 

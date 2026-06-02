@@ -15,12 +15,12 @@ pub struct Config {
 }
 
 impl Config {
-    /// The upstream used by the current single-route code path. Future routing
-    /// layers will replace this with a per-session pick over the full pool.
-    pub fn default_upstream(&self) -> &Upstream {
-        self.upstreams
-            .get(DEFAULT_UPSTREAM_NAME)
-            .expect("'default' upstream is required (validated in Config::load)")
+    /// The upstream a session falls back to when it doesn't pick a provider.
+    /// `None` when there is no `default` entry — a valid state: runic tolerates
+    /// an empty / default-less pool and is driven live via the admin API.
+    /// Sessions with no matching route fail cleanly (see `routing::pick_upstream`).
+    pub fn default_upstream(&self) -> Option<&Upstream> {
+        self.upstreams.get(DEFAULT_UPSTREAM_NAME)
     }
 }
 
@@ -55,12 +55,28 @@ impl Default for Admin {
     }
 }
 
+/// Transport kind for an upstream. `HttpConnect` relays through a gateway (the
+/// production path). `Direct` makes a plain TCP connect straight to the target
+/// — NOT proxied, local IP exposed — gated behind `RUNIC_ALLOW_DIRECT=1`, for
+/// dev/CI use only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamKind {
+    #[default]
+    HttpConnect,
+    Direct,
+}
+
 /// A resolved upstream entry. Credentials are in clear (resolved from env or
 /// inline at construction time) so they can be (de)serialized for the snapshot
 /// cache and the admin API. `UpstreamCreds`' manual `Debug` keeps the password
 /// out of logs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Upstream {
+    /// `#[serde(default)]` so snapshots written before this field existed
+    /// deserialize as `HttpConnect`.
+    #[serde(default)]
+    pub kind: UpstreamKind,
     pub host: String,
     pub port: u16,
     pub auth: UpstreamCreds,
@@ -98,9 +114,14 @@ struct RawFile {
 pub struct UpstreamSpec {
     #[serde(default = "default_kind")]
     pub kind: String,
-    pub host: String,
-    pub port: u16,
-    pub auth: CredsSpec,
+    /// Optional so a `kind: direct` entry can omit them (no gateway, no creds).
+    /// Required for `kind: http_connect` (validated in `resolve`).
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub auth: Option<CredsSpec>,
 }
 
 fn default_kind() -> String {
@@ -121,34 +142,74 @@ pub enum CredsSpec {
 
 impl UpstreamSpec {
     /// Validate the kind and resolve credentials into a runtime `Upstream`.
-    /// `name` is used only for error context.
+    /// `name` is used only for error context. This is the single chokepoint
+    /// both the cold YAML loader and the admin hot-add path go through, so the
+    /// `direct` opt-in guard below covers every way a `direct` upstream can be
+    /// introduced.
     pub fn resolve(self, name: &str) -> Result<Upstream> {
-        if self.kind != "http_connect" {
-            return Err(anyhow!(
-                "upstreams.{name}.kind = '{}' not supported (only 'http_connect')",
-                self.kind
-            ));
-        }
-        let auth = match self.auth {
-            CredsSpec::Inline { username, password } => UpstreamCreds { username, password },
-            CredsSpec::Env {
-                username_env,
-                password_env,
-            } => {
-                let username = std::env::var(&username_env).with_context(|| {
-                    format!("env var {username_env} (upstreams.{name}.auth.username_env) not set")
+        match self.kind.as_str() {
+            "http_connect" => {
+                let host = self.host.ok_or_else(|| {
+                    anyhow!("upstreams.{name}.host is required for kind=http_connect")
                 })?;
-                let password = std::env::var(&password_env).with_context(|| {
-                    format!("env var {password_env} (upstreams.{name}.auth.password_env) not set")
+                let port = self.port.ok_or_else(|| {
+                    anyhow!("upstreams.{name}.port is required for kind=http_connect")
                 })?;
-                UpstreamCreds { username, password }
+                let auth = self.auth.ok_or_else(|| {
+                    anyhow!("upstreams.{name}.auth is required for kind=http_connect")
+                })?;
+                Ok(Upstream {
+                    kind: UpstreamKind::HttpConnect,
+                    host,
+                    port,
+                    auth: resolve_creds(auth, name)?,
+                })
             }
-        };
-        Ok(Upstream {
-            host: self.host,
-            port: self.port,
-            auth,
-        })
+            "direct" => {
+                // Direct mode is NOT proxied: a plain TCP connect to the target,
+                // with the local IP exposed. Fail-closed behind an explicit env
+                // opt-in so it can never reach prod by a config copy-paste.
+                if std::env::var("RUNIC_ALLOW_DIRECT").ok().as_deref() != Some("1") {
+                    return Err(anyhow!(
+                        "upstreams.{name} kind=direct requires RUNIC_ALLOW_DIRECT=1 — \
+                         direct mode is NOT proxied (local IP exposed), dev/CI only"
+                    ));
+                }
+                // host/port/auth are meaningless for direct; ignore if present.
+                Ok(Upstream {
+                    kind: UpstreamKind::Direct,
+                    host: String::new(),
+                    port: 0,
+                    auth: UpstreamCreds {
+                        username: String::new(),
+                        password: String::new(),
+                    },
+                })
+            }
+            other => Err(anyhow!(
+                "upstreams.{name}.kind = '{other}' not supported (use 'http_connect' or 'direct')"
+            )),
+        }
+    }
+}
+
+/// Resolve a [`CredsSpec`] into clear [`UpstreamCreds`] (env-var indirection or
+/// inline). `name` is used only for error context.
+fn resolve_creds(spec: CredsSpec, name: &str) -> Result<UpstreamCreds> {
+    match spec {
+        CredsSpec::Inline { username, password } => Ok(UpstreamCreds { username, password }),
+        CredsSpec::Env {
+            username_env,
+            password_env,
+        } => {
+            let username = std::env::var(&username_env).with_context(|| {
+                format!("env var {username_env} (upstreams.{name}.auth.username_env) not set")
+            })?;
+            let password = std::env::var(&password_env).with_context(|| {
+                format!("env var {password_env} (upstreams.{name}.auth.password_env) not set")
+            })?;
+            Ok(UpstreamCreds { username, password })
+        }
     }
 }
 
@@ -162,25 +223,15 @@ impl Config {
     /// Load the full cold config: the data-plane `Config` plus the boot-time
     /// `Admin` listener address.
     pub fn load_with_admin(path: &Path) -> Result<(Self, Admin)> {
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("read config {}", path.display()))?;
-        let file: RawFile = serde_yaml::from_str(&raw)
-            .with_context(|| format!("parse YAML {}", path.display()))?;
+        let raw =
+            fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
+        let file: RawFile =
+            serde_yaml::from_str(&raw).with_context(|| format!("parse YAML {}", path.display()))?;
 
-        if file.upstreams.is_empty() {
-            return Err(anyhow!(
-                "config has no upstreams; declare at least one (e.g. `upstreams.default`)"
-            ));
-        }
-        if !file.upstreams.contains_key(DEFAULT_UPSTREAM_NAME) {
-            let names: Vec<&str> = file.upstreams.keys().map(String::as_str).collect();
-            return Err(anyhow!(
-                "config has no upstream named '{DEFAULT_UPSTREAM_NAME}'; \
-                 declared upstreams: {names:?}. \
-                 The current release routes all traffic through 'default'."
-            ));
-        }
-
+        // An empty pool, or a pool without a `default` entry, is valid: runic
+        // tolerates a bare config and is driven live via the admin API. Sessions
+        // that find no matching route fail cleanly (see `routing::pick_upstream`),
+        // rather than runic refusing to boot.
         let mut upstreams = BTreeMap::new();
         for (name, spec) in file.upstreams {
             let up = spec.resolve(&name)?;
@@ -230,11 +281,16 @@ upstreams:
     fn loads_valid_yaml() {
         std::env::set_var("RUNIC_T_CFG_USER_OK", "alice");
         std::env::set_var("RUNIC_T_CFG_PASS_OK", "s3cret");
-        let f = write_tmp(&yaml_with("http_connect", "RUNIC_T_CFG_USER_OK", "RUNIC_T_CFG_PASS_OK"));
+        let f = write_tmp(&yaml_with(
+            "http_connect",
+            "RUNIC_T_CFG_USER_OK",
+            "RUNIC_T_CFG_PASS_OK",
+        ));
 
         let cfg = Config::load(f.path()).unwrap();
 
-        let up = cfg.default_upstream();
+        let up = cfg.default_upstream().unwrap();
+        assert_eq!(up.kind, UpstreamKind::HttpConnect);
         assert_eq!(up.host, "gw.example.com");
         assert_eq!(up.port, 823);
         assert_eq!(up.auth.username, "alice");
@@ -272,24 +328,27 @@ upstreams:
         let cfg = Config::load(f.path()).unwrap();
 
         assert_eq!(cfg.upstreams.len(), 2);
-        assert_eq!(cfg.default_upstream().host, "gw-fr.example.com");
+        assert_eq!(cfg.default_upstream().unwrap().host, "gw-fr.example.com");
         assert_eq!(cfg.upstreams["us-residential"].host, "gw-us.example.com");
         assert_eq!(cfg.upstreams["us-residential"].auth.username, "us_user");
     }
 
     #[test]
-    fn rejects_empty_upstreams_pool() {
+    fn loads_empty_upstreams_pool() {
+        // An empty pool is valid now (silo / API-driven mode): runic boots and
+        // is configured live via the admin API.
         let yaml = r#"listen:
   addr: "127.0.0.1:7777"
 upstreams: {}
 "#;
         let f = write_tmp(yaml);
-        let err = Config::load(f.path()).unwrap_err();
-        assert!(err.to_string().contains("no upstreams"), "got: {err}");
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(cfg.upstreams.is_empty());
+        assert!(cfg.default_upstream().is_none());
     }
 
     #[test]
-    fn rejects_pool_without_default_entry() {
+    fn loads_pool_without_default_entry() {
         std::env::set_var("RUNIC_T_CFG_U_NODEF", "u");
         std::env::set_var("RUNIC_T_CFG_P_NODEF", "p");
         let yaml = r#"listen:
@@ -304,10 +363,52 @@ upstreams:
       password_env: RUNIC_T_CFG_P_NODEF
 "#;
         let f = write_tmp(yaml);
+        let cfg = Config::load(f.path()).unwrap();
+        // Loads fine; there's simply no fallback route until one is named.
+        assert_eq!(cfg.upstreams.len(), 1);
+        assert!(cfg.default_upstream().is_none());
+        assert_eq!(cfg.upstreams["primary"].host, "gw.example.com");
+    }
+
+    #[test]
+    fn direct_kind_gated_by_allow_env() {
+        // One test (not two) so the process-global `RUNIC_ALLOW_DIRECT` mutation
+        // is sequential — no parallel-test race. No other test touches this var.
+        let yaml = r#"listen:
+  addr: "127.0.0.1:7777"
+upstreams:
+  default:
+    kind: direct
+"#;
+        // Without the opt-in → fail-closed.
+        std::env::remove_var("RUNIC_ALLOW_DIRECT");
+        let f = write_tmp(yaml);
         let err = Config::load(f.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("'default'"), "got: {msg}");
-        assert!(msg.contains("primary"), "got: {msg}");
+        assert!(msg.contains("RUNIC_ALLOW_DIRECT"), "got: {msg}");
+        assert!(msg.contains("direct"), "got: {msg}");
+
+        // With the opt-in → resolves as a Direct upstream.
+        std::env::set_var("RUNIC_ALLOW_DIRECT", "1");
+        let cfg = Config::load(f.path()).unwrap();
+        std::env::remove_var("RUNIC_ALLOW_DIRECT");
+        assert_eq!(cfg.default_upstream().unwrap().kind, UpstreamKind::Direct);
+    }
+
+    #[test]
+    fn http_connect_missing_host_errors() {
+        let yaml = r#"listen:
+  addr: "127.0.0.1:7777"
+upstreams:
+  default:
+    kind: http_connect
+    auth:
+      username: u
+      password: p
+"#;
+        let f = write_tmp(yaml);
+        let err = Config::load(f.path()).unwrap_err();
+        assert!(err.to_string().contains("host"), "got: {err}");
     }
 
     #[test]
@@ -328,7 +429,11 @@ upstreams:
     fn rejects_unknown_upstream_kind() {
         std::env::set_var("RUNIC_T_CFG_USER_KIND", "u");
         std::env::set_var("RUNIC_T_CFG_PASS_KIND", "p");
-        let f = write_tmp(&yaml_with("socks5", "RUNIC_T_CFG_USER_KIND", "RUNIC_T_CFG_PASS_KIND"));
+        let f = write_tmp(&yaml_with(
+            "socks5",
+            "RUNIC_T_CFG_USER_KIND",
+            "RUNIC_T_CFG_PASS_KIND",
+        ));
 
         let err = Config::load(f.path()).unwrap_err();
         let msg = err.to_string();
@@ -365,6 +470,9 @@ upstreams:
             !dbg.contains("super-secret-password"),
             "password must be redacted: {dbg}"
         );
-        assert!(dbg.contains("redacted"), "expected explicit redaction marker: {dbg}");
+        assert!(
+            dbg.contains("redacted"),
+            "expected explicit redaction marker: {dbg}"
+        );
     }
 }

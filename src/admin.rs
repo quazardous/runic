@@ -80,7 +80,9 @@ async fn handle_conn(
     };
 
     let resp = route(&req, &store, started).await;
-    sock.write_all(&resp).await.context("write admin response")?;
+    sock.write_all(&resp)
+        .await
+        .context("write admin response")?;
     sock.flush().await.ok();
     Ok(())
 }
@@ -138,17 +140,29 @@ async fn route(req: &Request, store: &Arc<Mutex<ConfigStore>>, started: Instant)
         ("POST", path) if path.starts_with("/v1/upstreams/") => {
             let name = match upstream_name(path) {
                 Some(n) => n,
-                None => return json_response(400, "Bad Request", &json!({ "error": "missing upstream name" })),
+                None => {
+                    return json_response(
+                        400,
+                        "Bad Request",
+                        &json!({ "error": "missing upstream name" }),
+                    )
+                }
             };
             let spec: UpstreamSpec = match serde_json::from_slice(&req.body) {
                 Ok(s) => s,
                 Err(e) => {
-                    return json_response(400, "Bad Request", &json!({ "error": format!("invalid upstream body: {e}") }))
+                    return json_response(
+                        400,
+                        "Bad Request",
+                        &json!({ "error": format!("invalid upstream body: {e}") }),
+                    )
                 }
             };
             let up = match spec.resolve(&name) {
                 Ok(up) => up,
-                Err(e) => return json_response(400, "Bad Request", &json!({ "error": e.to_string() })),
+                Err(e) => {
+                    return json_response(400, "Bad Request", &json!({ "error": e.to_string() }))
+                }
             };
             let mut store = store.lock().await;
             if permanent {
@@ -159,12 +173,22 @@ async fn route(req: &Request, store: &Arc<Mutex<ConfigStore>>, started: Instant)
                 store.apply_runtime(name.clone(), up);
             }
             let source = store.diagnose().get(&name).copied();
-            json_response(200, "OK", &json!({ "name": name, "permanent": permanent, "source": source }))
+            json_response(
+                200,
+                "OK",
+                &json!({ "name": name, "permanent": permanent, "source": source }),
+            )
         }
         ("DELETE", path) if path.starts_with("/v1/upstreams/") => {
             let name = match upstream_name(path) {
                 Some(n) => n,
-                None => return json_response(400, "Bad Request", &json!({ "error": "missing upstream name" })),
+                None => {
+                    return json_response(
+                        400,
+                        "Bad Request",
+                        &json!({ "error": "missing upstream name" }),
+                    )
+                }
             };
             let mut store = store.lock().await;
             let removed = if permanent {
@@ -176,10 +200,18 @@ async fn route(req: &Request, store: &Arc<Mutex<ConfigStore>>, started: Instant)
                 store.remove_runtime(&name)
             };
             if !removed {
-                return json_response(404, "Not Found", &json!({ "error": format!("no runtime/snapshot entry '{name}'") }));
+                return json_response(
+                    404,
+                    "Not Found",
+                    &json!({ "error": format!("no runtime/snapshot entry '{name}'") }),
+                );
             }
             let fallback = store.diagnose().get(&name).copied();
-            json_response(200, "OK", &json!({ "name": name, "removed": true, "permanent": permanent, "now": fallback }))
+            json_response(
+                200,
+                "OK",
+                &json!({ "name": name, "removed": true, "permanent": permanent, "now": fallback }),
+            )
         }
         _ => json_response(404, "Not Found", &json!({ "error": "no such route" })),
     }
@@ -187,7 +219,11 @@ async fn route(req: &Request, store: &Arc<Mutex<ConfigStore>>, started: Instant)
 
 fn persist_error(e: anyhow::Error) -> Vec<u8> {
     warn!(error = %e, "admin snapshot persistence failed");
-    json_response(500, "Internal Server Error", &json!({ "error": e.to_string() }))
+    json_response(
+        500,
+        "Internal Server Error",
+        &json!({ "error": e.to_string() }),
+    )
 }
 
 /// Extract the `<name>` from `/v1/upstreams/<name>` (URL-decoded minimally).
@@ -243,11 +279,15 @@ async fn read_request(sock: &mut TcpStream) -> Result<Request> {
         buf.extend_from_slice(&chunk[..n]);
     };
 
-    let head = std::str::from_utf8(&buf[..header_end]).map_err(|_| anyhow!("request head not UTF-8"))?;
+    let head =
+        std::str::from_utf8(&buf[..header_end]).map_err(|_| anyhow!("request head not UTF-8"))?;
     let mut lines = head.split("\r\n");
     let request_line = lines.next().ok_or_else(|| anyhow!("empty request"))?;
     let mut parts = request_line.split(' ');
-    let method = parts.next().ok_or_else(|| anyhow!("missing method"))?.to_string();
+    let method = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing method"))?
+        .to_string();
     let target = parts.next().ok_or_else(|| anyhow!("missing target"))?;
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
@@ -270,7 +310,10 @@ async fn read_request(sock: &mut TcpStream) -> Result<Request> {
     let body_start = header_end + 4;
     let mut body = buf[body_start..].to_vec();
     while body.len() < content_length {
-        let n = sock.read(&mut chunk).await.context("read admin request body")?;
+        let n = sock
+            .read(&mut chunk)
+            .await
+            .context("read admin request body")?;
         if n == 0 {
             break;
         }
@@ -287,9 +330,7 @@ async fn read_request(sock: &mut TcpStream) -> Result<Request> {
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
@@ -305,9 +346,13 @@ mod tests {
         upstreams.insert(
             "default".to_string(),
             crate::config::Upstream {
+                kind: crate::config::UpstreamKind::HttpConnect,
                 host: "cold.example".into(),
                 port: 823,
-                auth: crate::config::UpstreamCreds { username: "u".into(), password: "p".into() },
+                auth: crate::config::UpstreamCreds {
+                    username: "u".into(),
+                    password: "p".into(),
+                },
             },
         );
         let cold = Config {
@@ -364,7 +409,11 @@ mod tests {
     #[tokio::test]
     async fn status_returns_pool_size() {
         let (addr, _dir) = test_server().await;
-        let (code, body) = http(addr, "GET /v1/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        let (code, body) = http(
+            addr,
+            "GET /v1/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         assert_eq!(code, 200);
         assert!(body.contains("\"pool_size\":1"), "got: {body}");
         assert!(body.contains("\"status\":\"ok\""), "got: {body}");
@@ -376,7 +425,11 @@ mod tests {
         let (code, _) = http(addr, &post_upstream("us", "us.example", false)).await;
         assert_eq!(code, 200);
 
-        let (_, body) = http(addr, "GET /v1/diagnose HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        let (_, body) = http(
+            addr,
+            "GET /v1/diagnose HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         assert!(body.contains("\"us\":\"hot\""), "got: {body}");
     }
 
@@ -394,7 +447,11 @@ mod tests {
         let (addr, _dir) = test_server().await;
         http(addr, &post_upstream("us", "snap.example", true)).await;
         http(addr, &post_upstream("us", "hot.example", false)).await;
-        let (code, body) = http(addr, "DELETE /v1/upstreams/us HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        let (code, body) = http(
+            addr,
+            "DELETE /v1/upstreams/us HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         assert_eq!(code, 200);
         assert!(body.contains("\"now\":\"snapshot\""), "got: {body}");
     }
@@ -402,7 +459,11 @@ mod tests {
     #[tokio::test]
     async fn delete_unknown_upstream_404() {
         let (addr, _dir) = test_server().await;
-        let (code, _) = http(addr, "DELETE /v1/upstreams/nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        let (code, _) = http(
+            addr,
+            "DELETE /v1/upstreams/nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         assert_eq!(code, 404);
     }
 
@@ -417,7 +478,11 @@ mod tests {
     #[tokio::test]
     async fn unknown_route_404() {
         let (addr, _dir) = test_server().await;
-        let (code, _) = http(addr, "GET /v1/nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        let (code, _) = http(
+            addr,
+            "GET /v1/nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         assert_eq!(code, 404);
     }
 
@@ -426,7 +491,11 @@ mod tests {
         let (addr, _dir) = test_server().await;
         // shadow the cold 'default' with a runtime entry
         http(addr, &post_upstream("default", "hot.example", false)).await;
-        let (code, body) = http(addr, "GET /v1/diff HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        let (code, body) = http(
+            addr,
+            "GET /v1/diff HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         assert_eq!(code, 200);
         assert!(body.contains("\"default\""), "got: {body}");
         assert!(body.contains("\"effective\":\"hot\""), "got: {body}");
@@ -441,6 +510,7 @@ mod tests {
         upstreams.insert(
             "default".to_string(),
             crate::config::Upstream {
+                kind: crate::config::UpstreamKind::HttpConnect,
                 host: "cold.example".into(),
                 port: 823,
                 auth: crate::config::UpstreamCreds {
