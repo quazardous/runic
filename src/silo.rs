@@ -389,8 +389,9 @@ impl VariationCache {
     }
 
     /// Drop variations idle past `idle_ttl_secs` from RAM, stamping their on-disk
-    /// last-access so the disk decay TTL counts from cold. Returns how many evicted.
-    pub fn evict_idle(&mut self, now: u64) -> Result<usize> {
+    /// last-access so the disk decay TTL counts from cold. Returns the evicted ids
+    /// (so a caller can tear down anything bound to them, e.g. `none`-mode ports).
+    pub fn evict_idle(&mut self, now: u64) -> Result<Vec<String>> {
         let cold: Vec<String> = self
             .warm
             .iter()
@@ -401,7 +402,23 @@ impl VariationCache {
             self.warm.remove(id);
             self.store.touch_id(id, now)?;
         }
-        Ok(cold.len())
+        Ok(cold)
+    }
+
+    /// The decrypted config of a currently-**warm** variation, by id, **without a
+    /// token** (the plaintext is already in RAM). Touches last-access so an
+    /// actively-served `none`-mode port keeps its variation warm. `None` once the
+    /// variation has been evicted.
+    pub fn peek_warm(&mut self, id: &str, now: u64) -> Option<VariationData> {
+        let e = self.warm.get_mut(id)?;
+        e.last_touch = now;
+        Some(e.data.clone())
+    }
+
+    /// The variation id for a token (its `SHA256`), for callers that need to key a
+    /// port/registry by id after an `access`/`create`.
+    pub fn id_of(token: &str) -> Option<String> {
+        decode_token(token).ok().map(|t| variation_id(&t))
     }
 
     /// Disk decay GC that never purges a variation currently warm in RAM.
@@ -411,8 +428,9 @@ impl VariationCache {
     }
 
     /// One maintenance pass: evict idle warm entries, then run the disk decay GC.
-    /// Returns `(evicted, purged)`. This is what the background sweeper calls.
-    pub fn sweep(&mut self, now: u64) -> Result<(usize, usize)> {
+    /// Returns `(evicted_ids, purged_count)`. This is what the background sweeper
+    /// calls — the evicted ids let it also tear down their `none`-mode ports.
+    pub fn sweep(&mut self, now: u64) -> Result<(Vec<String>, usize)> {
         let evicted = self.evict_idle(now)?;
         let purged = self.gc(now)?;
         Ok((evicted, purged))
@@ -706,8 +724,8 @@ mod tests {
         c.access(&token, 0).unwrap();
         assert_eq!(c.warm_len(), 1);
 
-        assert_eq!(c.evict_idle(50).unwrap(), 0, "not idle yet");
-        assert_eq!(c.evict_idle(200).unwrap(), 1, "idle past 100s");
+        assert_eq!(c.evict_idle(50).unwrap().len(), 0, "not idle yet");
+        assert_eq!(c.evict_idle(200).unwrap().len(), 1, "idle past 100s");
         assert_eq!(c.warm_len(), 0);
 
         // Re-access re-decrypts from disk — data intact.
@@ -747,7 +765,7 @@ mod tests {
         // At t=200: A is idle-evicted from RAM (its disk stamp refreshed to 200,
         // so it survives the disk GC); B (cold, last_access 0) is purged.
         let (evicted, purged) = c.sweep(200).unwrap();
-        assert_eq!(evicted, 1, "A evicted from RAM");
+        assert_eq!(evicted.len(), 1, "A evicted from RAM");
         assert_eq!(purged, 1, "B purged from disk");
         assert!(c.access(&a, 201).is_ok(), "A survived (was warm at sweep)");
         assert!(c.access(&b, 201).is_err(), "B was purged");

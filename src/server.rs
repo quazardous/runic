@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
@@ -5,11 +6,11 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, ListenAuth, Upstream, UpstreamKind};
-use crate::silo::VariationCache;
+use crate::silo::{VariationCache, VariationData};
 use crate::upstream;
 
 const SOCKS5_VERSION: u8 = 0x05;
@@ -57,7 +58,7 @@ pub async fn run(
                 let session_cfg = cfg_rx.borrow().clone();
                 let silo = silo.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve(client, &session_cfg, &silo).await {
+                    if let Err(e) = serve(client, &session_cfg, &silo, None).await {
                         warn!(%peer, error = %e, "session ended with error");
                     }
                 });
@@ -84,6 +85,84 @@ pub async fn run(
                 } else {
                     debug!("config changed (upstream / auth); future sessions will use new values");
                 }
+            }
+        }
+    }
+}
+
+/// Registry of `none`-mode dedicated loopback listeners — one no-auth SOCKS5
+/// port per warm variation, for clients (browsers) that can't carry the token in
+/// the SOCKS5 handshake. Idempotent: opening a variation whose port is already
+/// live returns that port; the sweeper closes ports for evicted variation ids.
+pub struct SiloPorts {
+    inner: Mutex<HashMap<String, BoundPort>>,
+    cfg_rx: watch::Receiver<Arc<Config>>,
+    cache: Arc<Mutex<VariationCache>>,
+}
+
+struct BoundPort {
+    port: u16,
+    shutdown: Arc<Notify>,
+}
+
+impl SiloPorts {
+    pub fn new(
+        cfg_rx: watch::Receiver<Arc<Config>>,
+        cache: Arc<Mutex<VariationCache>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(HashMap::new()),
+            cfg_rx,
+            cache,
+        })
+    }
+
+    /// Bind (or reuse — idempotent while the variation is warm) a dedicated
+    /// no-auth loopback listener for variation `id`, returning its port.
+    pub async fn ensure(self: &Arc<Self>, id: &str) -> Result<u16> {
+        let mut map = self.inner.lock().await;
+        if let Some(b) = map.get(id) {
+            return Ok(b.port);
+        }
+        let listener = TcpListener::bind(("127.0.0.1", 0u16))
+            .await
+            .context("bind silo none-mode port")?;
+        let port = listener.local_addr()?.port();
+        let shutdown = Arc::new(Notify::new());
+        let me = self.clone();
+        let id_owned = id.to_string();
+        let sd = shutdown.clone();
+        tokio::spawn(async move { me.run_port(listener, id_owned, sd).await });
+        map.insert(id.to_string(), BoundPort { port, shutdown });
+        info!(%id, port, "silo none-mode port bound");
+        Ok(port)
+    }
+
+    async fn run_port(self: Arc<Self>, listener: TcpListener, id: String, shutdown: Arc<Notify>) {
+        loop {
+            tokio::select! {
+                _ = shutdown.notified() => break,
+                res = listener.accept() => {
+                    let client = match res { Ok((c, _)) => c, Err(_) => continue };
+                    let cfg = self.cfg_rx.borrow().clone();
+                    let cache = Some(self.cache.clone());
+                    let id = id.clone();
+                    tokio::spawn(async move {
+                        let _ = serve(client, &cfg, &cache, Some(&id)).await;
+                    });
+                }
+            }
+        }
+        debug!(%id, "silo none-mode port closed");
+        // `listener` is dropped here → the OS releases the port.
+    }
+
+    /// Close the dedicated ports for these (evicted) variation ids.
+    pub async fn close(&self, ids: &[String]) {
+        let mut map = self.inner.lock().await;
+        for id in ids {
+            if let Some(b) = map.remove(id) {
+                b.shutdown.notify_one();
             }
         }
     }
@@ -126,6 +205,7 @@ async fn serve(
     mut client: TcpStream,
     cfg: &Config,
     silo: &Option<Arc<Mutex<VariationCache>>>,
+    port_variation_id: Option<&str>,
 ) -> Result<()> {
     let creds = negotiate_method(&mut client, &cfg.listen.auth).await?;
     let (host, port) = parse_request(&mut client).await?;
@@ -137,8 +217,9 @@ async fn serve(
     );
 
     // Resolve the upstream for this session (owned). In silo mode the SOCKS5
-    // password carries the silo token; otherwise routing is by the username.
-    let chosen_upstream = match resolve_route(cfg, silo, creds.as_ref()).await {
+    // password carries the silo token; on a `none`-mode dedicated port the
+    // variation is fixed by id (no token); otherwise routing is by the username.
+    let chosen_upstream = match resolve_route(cfg, silo, creds.as_ref(), port_variation_id).await {
         Some(u) => u,
         None => {
             // No matching route: empty pool, unknown provider/silo-token, or no
@@ -189,26 +270,42 @@ async fn resolve_route(
     cfg: &Config,
     silo: &Option<Arc<Mutex<VariationCache>>>,
     creds: Option<&UserPass>,
+    port_variation_id: Option<&str>,
 ) -> Option<Upstream> {
     let user = creds.map(|c| c.username.as_str());
+
+    // `none`-mode dedicated port: the variation is fixed by id, served from the
+    // warm cache without a token (it was decrypted at `open` time).
+    if let Some(id) = port_variation_id {
+        let cache = silo.as_ref()?;
+        let data = cache.lock().await.peek_warm(id, unix_now())?;
+        return pick_from_merged(cfg, data, user);
+    }
+
     match silo {
         None => crate::routing::pick_upstream(cfg, user).cloned(),
         Some(cache) => {
+            // rfc1929: the SOCKS5 password is the silo token.
             let token = creds
                 .map(|c| c.password.as_str())
                 .filter(|p| !p.is_empty())?;
             let data = cache.lock().await.access(token, unix_now()).ok()?;
-            // Session pool = cold base overlaid with this variation's config.
-            let mut pool = cfg.upstreams.clone();
-            pool.extend(data.upstreams);
-            let session = Config {
-                listen: cfg.listen.clone(),
-                upstreams: pool,
-                active_route: cfg.active_route.clone(),
-            };
-            crate::routing::pick_upstream(&session, user).cloned()
+            pick_from_merged(cfg, data, user)
         }
     }
+}
+
+/// Pick an upstream over the session pool = cold base overlaid with the
+/// variation's config (the variation wins on a name clash).
+fn pick_from_merged(cfg: &Config, data: VariationData, user: Option<&str>) -> Option<Upstream> {
+    let mut pool = cfg.upstreams.clone();
+    pool.extend(data.upstreams);
+    let session = Config {
+        listen: cfg.listen.clone(),
+        upstreams: pool,
+        active_route: cfg.active_route.clone(),
+    };
+    crate::routing::pick_upstream(&session, user).cloned()
 }
 
 /// Current unix time in seconds (the silo clock).

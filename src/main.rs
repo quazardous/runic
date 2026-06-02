@@ -52,35 +52,50 @@ async fn main() -> Result<()> {
     let (cfg, admin_cfg, silo_cfg) = config::Config::load_with_admin(&cli.config)?;
     let snapshot_path = store::default_snapshot_path();
 
-    // Silo mode (opt-in): an encrypted per-variation config store, opened next to
-    // the snapshot. Shared with the admin API (and, in a later slice, the data
-    // plane). Absent ⇒ plain mode, unchanged.
+    // Silo mode (opt-in): the encrypted per-variation config store + its default
+    // binding mode. Absent ⇒ plain mode, unchanged.
     let silo = match silo_cfg.as_ref().filter(|s| s.enabled) {
         Some(s) => {
             let dir = snapshot_path
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .join("runic.silo");
-            let cache = silo::VariationCache::new(
+            let cache = Arc::new(Mutex::new(silo::VariationCache::new(
                 silo::SiloStore::open(dir, s.ttl_days * 86_400)?,
                 SILO_IDLE_TTL_SECS,
-            );
+            )));
             tracing::info!(auth = ?s.auth, ttl_days = s.ttl_days, "config silo mode enabled");
-            Some(Arc::new(Mutex::new(cache)))
+            Some((cache, s.auth))
         }
         None => None,
     };
 
-    // Background sweeper: evict idle warm variations + run the disk decay GC.
-    if let Some(cache) = silo.clone() {
+    let (config_store, cfg_rx) = store::ConfigStore::new(cfg, snapshot_path);
+    let config_store = Arc::new(Mutex::new(config_store));
+
+    // Silo runtime: the `none`-mode port registry + the admin handle, plus a
+    // background sweeper that evicts idle variations and tears down their ports.
+    let silo_admin = silo.as_ref().map(|(cache, mode)| {
+        let ports = server::SiloPorts::new(cfg_rx.clone(), cache.clone());
+        admin::SiloAdmin {
+            cache: cache.clone(),
+            ports,
+            default_mode: *mode,
+        }
+    });
+    if let Some(sa) = silo_admin.as_ref() {
+        let cache = sa.cache.clone();
+        let ports = sa.ports.clone();
         tokio::spawn(async move {
             let mut tick =
                 tokio::time::interval(std::time::Duration::from_secs(SILO_SWEEP_INTERVAL_SECS));
             loop {
                 tick.tick().await;
-                match cache.lock().await.sweep(unix_now()) {
-                    Ok((e, p)) if e > 0 || p > 0 => {
-                        tracing::debug!(evicted = e, purged = p, "silo sweep")
+                let swept = { cache.lock().await.sweep(unix_now()) };
+                match swept {
+                    Ok((evicted, purged)) if !evicted.is_empty() || purged > 0 => {
+                        ports.close(&evicted).await;
+                        tracing::debug!(evicted = evicted.len(), purged, "silo sweep");
                     }
                     Ok(_) => {}
                     Err(err) => tracing::warn!(error = %err, "silo sweep failed"),
@@ -89,11 +104,9 @@ async fn main() -> Result<()> {
         });
     }
 
-    let (config_store, cfg_rx) = store::ConfigStore::new(cfg, snapshot_path);
-    let config_store = Arc::new(Mutex::new(config_store));
-
     watcher::spawn(cli.config.clone(), config_store.clone())?;
-    admin::spawn(admin_cfg.addr, config_store.clone(), silo.clone()).await?;
+    admin::spawn(admin_cfg.addr, config_store.clone(), silo_admin).await?;
 
-    server::run(cfg_rx, silo).await
+    let server_silo = silo.map(|(cache, _)| cache);
+    server::run(cfg_rx, server_silo).await
 }
