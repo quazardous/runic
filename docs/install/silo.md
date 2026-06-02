@@ -30,7 +30,7 @@ listen:
 silo:
   enabled: true
   ttl_days: 7          # idle variations are purged after this many days
-  auth: rfc1929        # client→config binding mode: rfc1929 (default) | none
+  auth: rfc1929        # DEFAULT client→config binding mode: rfc1929 | none
 ```
 
 When `silo.enabled` is true, runic keeps a `runic.silo/` directory next to its
@@ -40,6 +40,14 @@ snapshot:
   the token's one-way hash, timestamps, and the (public) encryption nonce. This
   is what lets the idle-purge run without any token.
 - one **encrypted blob** per client config.
+
+**Binding mode is per-`open`, not just cold YAML.** `silo.auth` only sets the
+*default* mode for an `open` call that doesn't specify one. The mode is really a
+**transport choice** (how a client reaches its config), and the token itself is
+mode-agnostic — so a caller picks it per `open` with a `mode` field (see below).
+That matters for a box brought up with **no cold YAML** (configured entirely over
+the API): the orchestrator just calls `open` with `mode: none` — no `silo.auth`
+in a file is required.
 
 ## Model
 
@@ -74,10 +82,19 @@ The `silo_token_unknown` response is the **deterministic lost/expired signal**:
 on it, the client re-opens **without** auth to get a fresh token, then re-pushes
 its config (see [Lifecycle](#lifecycle)).
 
+**Choosing the mode per call.** An optional JSON body `{"mode": "rfc1929" | "none"}`
+overrides the instance default (`silo.auth`) for that `open`. So a box with no
+cold YAML is fully driveable over the API — the orchestrator just opens with the
+mode it needs:
+
 ```bash
 # First run: get a token, keep it safe (runic won't show it again).
 curl -X POST http://127.0.0.1:7778/v1/silo/open
-# → {"token":"q1w2...e3r4"}
+# → {"token":"q1w2...e3r4"}                     (instance default mode)
+
+# Browser deployment, no cold YAML: ask for a no-auth port up front.
+curl -X POST http://127.0.0.1:7778/v1/silo/open -d '{"mode":"none"}'
+# → {"token":"q1w2...e3r4","port":41987}
 ```
 
 ## Configuring your silo
