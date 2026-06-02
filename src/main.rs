@@ -34,7 +34,16 @@ async fn main() -> Result<()> {
         .with_target(true)
         .init();
 
-    let (cfg, admin_cfg) = config::Config::load_with_admin(&cli.config)?;
+    let (cfg, admin_cfg, silo_cfg) = config::Config::load_with_admin(&cli.config)?;
+    if let Some(silo) = silo_cfg.as_ref().filter(|s| s.enabled) {
+        // Binding layer (variation serving) is wired in a following step; for now
+        // surface that silo mode is selected and which client-binding it expects.
+        tracing::info!(
+            auth = ?silo.auth,
+            ttl_days = silo.ttl_days,
+            "config silo mode enabled"
+        );
+    }
     let snapshot_path = store::default_snapshot_path();
     let (config_store, cfg_rx) = store::ConfigStore::new(cfg, snapshot_path);
     let config_store = Arc::new(Mutex::new(config_store));
