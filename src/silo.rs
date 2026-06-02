@@ -383,6 +383,7 @@ mod tests {
         upstreams.insert(
             "default".to_string(),
             Upstream {
+                kind: crate::config::UpstreamKind::HttpConnect,
                 host: host.to_string(),
                 port: 823,
                 auth: crate::config::UpstreamCreds {
