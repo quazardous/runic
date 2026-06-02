@@ -129,6 +129,12 @@ then points the browser at `socks5://127.0.0.1:41987` (no auth). runic serves
 that port from the client's config. Idle ports are torn down (the same
 keep-alive that evicts the decrypted config from RAM).
 
+**Port lifecycle.** While a token is warm, re-opening with it returns the **same**
+port (the call is idempotent — cheap to repeat). After an idle teardown, the port
+is released and a fresh open binds a **new** one. So clients should **re-open
+whenever they need to route and use the port returned**, rather than caching a
+port across idle periods.
+
 ## Lifecycle
 
 - **Warm start** — the client still has its token: `POST /v1/silo/open` with
