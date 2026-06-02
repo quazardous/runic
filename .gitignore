@@ -13,3 +13,6 @@ Cargo.lock.bak
 # Internal working dir (notes, prior-art scans, bug files) — never pushed to the
 # public repo: may reference private tracker tickets / internal context.
 /dev
+
+# Local MCP server config (references internal tooling — not for the public repo)
+.mcp.json
