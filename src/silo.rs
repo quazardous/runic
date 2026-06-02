@@ -4,7 +4,7 @@
 //! is an independently encrypted snapshot of the config, opened by a per-variation
 //! **token** the silo mints once and then forgets.
 //!
-//! Security model (residential box, foreign zone — see ticket discussion):
+//! Security model (untrusted host — see `docs/install/silo.md`):
 //! - **token** = the per-variation secret. 256-bit, machine-minted. It is the
 //!   only thing that decrypts a variation. It lives **off the box** (held by the
 //!   client/skynet), in runic's RAM only for the duration of an operation.
