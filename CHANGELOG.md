@@ -46,6 +46,14 @@ Pre-1.0 development; nothing tagged yet. So far runic can:
   fall back to the `default` entry. An operator flips which provider new
   sessions use on the fly — clients keep talking to the same local port and
   never see the change.
+- **Keep config encrypted on an untrusted host (opt-in "silo" mode).** A client
+  opens the silo and gets a token — its key, which it holds off the box. runic
+  keeps only an encrypted blob plus a one-way fingerprint on disk, so a seized,
+  powered-off machine reveals neither the providers nor their credentials. Each
+  token has its own isolated config; configs are dropped from memory when idle
+  and expire on a TTL. A client binds either by sending its token as the SOCKS5
+  password, or — for clients that can't authenticate to SOCKS5, like browsers —
+  by asking for a dedicated loopback port. See `docs/install/silo.md`.
 - **Reuse the proxy as a library.** The core is published as a library with the
   command-line tool layered on top, so another front-end (for example a desktop
   tray app) can drive the same engine.
@@ -58,6 +66,11 @@ Pre-1.0 development; nothing tagged yet. So far runic can:
   whoever can reach them is trusted — keep them off public interfaces. Upstream
   credentials come from the environment; if you persist runtime changes, the
   saved file holds those credentials in clear and is written owner-only.
+- In silo mode the per-client encryption key never touches the box's disk — it
+  lives off-box and is held in memory only while a client is active. On disk
+  runic keeps only the ciphertext and a one-way `SHA256(token)` index (the AEAD
+  key is a *separate* HKDF derivation, so the on-disk index can't decrypt). A
+  lost token means a fresh config, by design — there is no key recovery.
 - The `direct` upstream kind is **not** proxied — the target sees the machine's
   own IP, with no provider in between. It is fail-closed: runic refuses to start
   (and the admin API rejects the change) unless `RUNIC_ALLOW_DIRECT=1` is set,
