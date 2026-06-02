@@ -410,6 +410,14 @@ impl VariationCache {
         self.store.gc_except(now, &protected)
     }
 
+    /// One maintenance pass: evict idle warm entries, then run the disk decay GC.
+    /// Returns `(evicted, purged)`. This is what the background sweeper calls.
+    pub fn sweep(&mut self, now: u64) -> Result<(usize, usize)> {
+        let evicted = self.evict_idle(now)?;
+        let purged = self.gc(now)?;
+        Ok((evicted, purged))
+    }
+
     pub fn warm_len(&self) -> usize {
         self.warm.len()
     }
@@ -727,6 +735,22 @@ mod tests {
             c.access(&warm, 201).is_ok(),
             "warm variation should survive"
         );
+    }
+
+    #[test]
+    fn cache_sweep_evicts_idle_and_purges_expired() {
+        let (mut c, _d) = cache(100, 50); // disk TTL 100s, idle TTL 50s
+        let a = c.create(0).unwrap();
+        c.access(&a, 0).unwrap(); // A is warm
+        let b = c.create(0).unwrap(); // B stays cold on disk
+
+        // At t=200: A is idle-evicted from RAM (its disk stamp refreshed to 200,
+        // so it survives the disk GC); B (cold, last_access 0) is purged.
+        let (evicted, purged) = c.sweep(200).unwrap();
+        assert_eq!(evicted, 1, "A evicted from RAM");
+        assert_eq!(purged, 1, "B purged from disk");
+        assert!(c.access(&a, 201).is_ok(), "A survived (was warm at sweep)");
+        assert!(c.access(&b, 201).is_err(), "B was purged");
     }
 
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {

@@ -15,6 +15,17 @@ use runic::{admin, config, server, silo, store, watcher};
 /// keep-alive cache evicts it (and drops its plaintext config from memory).
 const SILO_IDLE_TTL_SECS: u64 = 300;
 
+/// How often the background sweeper evicts idle warm variations and runs the
+/// disk decay GC.
+const SILO_SWEEP_INTERVAL_SECS: u64 = 60;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "runic",
@@ -59,6 +70,24 @@ async fn main() -> Result<()> {
         }
         None => None,
     };
+
+    // Background sweeper: evict idle warm variations + run the disk decay GC.
+    if let Some(cache) = silo.clone() {
+        tokio::spawn(async move {
+            let mut tick =
+                tokio::time::interval(std::time::Duration::from_secs(SILO_SWEEP_INTERVAL_SECS));
+            loop {
+                tick.tick().await;
+                match cache.lock().await.sweep(unix_now()) {
+                    Ok((e, p)) if e > 0 || p > 0 => {
+                        tracing::debug!(evicted = e, purged = p, "silo sweep")
+                    }
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!(error = %err, "silo sweep failed"),
+                }
+            }
+        });
+    }
 
     let (config_store, cfg_rx) = store::ConfigStore::new(cfg, snapshot_path);
     let config_store = Arc::new(Mutex::new(config_store));
