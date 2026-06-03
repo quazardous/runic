@@ -16,10 +16,14 @@
 
 mod autostart;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use tao::event::StartCause;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -27,6 +31,16 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuIt
 use tray_icon::{Icon, TrayIconBuilder};
 
 use runic::{admin, config, server, stats, store, watcher};
+
+/// How often the tray polls the admin status API to refresh the icon colour.
+const POLL_EVERY: Duration = Duration::from_secs(3);
+
+/// Active-route classification polled from `GET /v1/status`, stored in a shared
+/// atomic so the event loop can recolour the icon without blocking on I/O.
+const ROUTE_UNKNOWN: u8 = 0; // status not reachable yet
+const ROUTE_PROXIED: u8 = 1; // active route exits through a proxy upstream
+const ROUTE_DIRECT: u8 = 2; // a direct (non-proxied) route is active — local IP exposed
+const ROUTE_NOROUTE: u8 = 3; // no active route (empty pool / boot-empty)
 
 /// Owns the tokio runtime and the running proxy tasks. Start spins the core up;
 /// Stop aborts the SOCKS5 server task.
@@ -39,6 +53,9 @@ struct Supervisor {
     /// App-lifetime live session counters, shared by the admin status endpoint
     /// and each SOCKS5 server task.
     stats: Arc<stats::Stats>,
+    /// Loopback address of the admin API, captured at boot — the tray polls
+    /// `GET /v1/status` here to colour the icon by active route.
+    admin_addr: Option<SocketAddr>,
     server_task: Option<JoinHandle<()>>,
 }
 
@@ -52,6 +69,7 @@ impl Supervisor {
             config_path,
             cfg_rx: None,
             stats: stats::Stats::new(),
+            admin_addr: None,
             server_task: None,
         })
     }
@@ -74,7 +92,7 @@ impl Supervisor {
         }
         let path = self.config_path.clone();
         let stats = self.stats.clone();
-        let cfg_rx = self.rt.block_on(async move {
+        let (cfg_rx, admin_addr) = self.rt.block_on(async move {
             // NOTE: the tray runs the core in plain (non-silo) mode. Silo mode is
             // opt-in and adds the encrypted per-variation store + sweeper; wire it
             // here later mirroring the CLI `main` (pass the cache to admin::spawn
@@ -86,9 +104,10 @@ impl Supervisor {
 
             watcher::spawn(path.clone(), cfg_store.clone())?;
             admin::spawn(admin_cfg.addr, cfg_store.clone(), None, stats).await?;
-            Ok::<_, anyhow::Error>(cfg_rx)
+            Ok::<_, anyhow::Error>((cfg_rx, admin_cfg.addr))
         })?;
         self.cfg_rx = Some(cfg_rx);
+        self.admin_addr = Some(admin_addr);
         Ok(())
     }
 
@@ -101,10 +120,7 @@ impl Supervisor {
             return Ok(());
         }
         self.boot()?;
-        let cfg_rx = self
-            .cfg_rx
-            .clone()
-            .expect("cfg_rx is set by boot() above");
+        let cfg_rx = self.cfg_rx.clone().expect("cfg_rx is set by boot() above");
         let stats = self.stats.clone();
         let task = self.rt.handle().spawn(async move {
             if let Err(e) = server::run(cfg_rx, None, stats).await {
@@ -146,7 +162,7 @@ const RAIDHO_STROKES: &[(f32, f32, f32, f32)] = &[
 
 /// Tray icon state. Same Raidho glyph, different tint — the colour carries the
 /// runtime state at a glance on the taskbar (readable on light + dark themes).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum IconState {
     /// Proxy not running.
     Stopped,
@@ -154,11 +170,9 @@ enum IconState {
     Running,
     /// Up but a `kind:direct` upstream is active: local IP EXPOSED, not proxied.
     /// Amber on purpose — the user must never mistake this for anonymised.
-    #[allow(dead_code)] // wired once the core surfaces the active-upstream kind
     Direct,
     /// Up with an empty pool / no route yet (boot-empty; sessions declined until
     /// configured over the admin API).
-    #[allow(dead_code)] // wired once the core surfaces "no route"
     NoRoute,
     /// Failed to start / degraded.
     Error,
@@ -222,6 +236,50 @@ fn draw_segment(
             }
         }
     }
+}
+
+/// Poll `GET /v1/status` on the loopback admin API and classify the active route
+/// for the tray icon. Returns a `ROUTE_*` code; `ROUTE_UNKNOWN` on any failure.
+///
+/// Conservative on exposure: amber (`ROUTE_DIRECT`) as soon as the status
+/// reports any active direct session OR a direct active route — the user must
+/// never see "proxied" while their IP is exposed.
+async fn fetch_route(addr: SocketAddr) -> u8 {
+    async fn inner(addr: SocketAddr) -> Option<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.ok()?;
+        stream
+            .write_all(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .ok()?;
+        let mut buf = Vec::with_capacity(2048);
+        stream.read_to_end(&mut buf).await.ok()?;
+        let text = String::from_utf8_lossy(&buf);
+        // The body is the outermost JSON object; this skips HTTP headers and any
+        // Content-Length / single-chunk framing without a full HTTP parser.
+        let json = &text[text.find('{')?..=text.rfind('}')?];
+        let v: serde_json::Value = serde_json::from_str(json).ok()?;
+
+        let any_direct = v
+            .get("any_active_direct")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+        let route_is_direct = v
+            .get("active_route")
+            .and_then(|r| r.get("kind"))
+            .and_then(|k| k.as_str())
+            == Some("direct");
+        let no_route = v.get("active_route").map(|r| r.is_null()).unwrap_or(true);
+
+        Some(if any_direct || route_is_direct {
+            ROUTE_DIRECT
+        } else if no_route {
+            ROUTE_NOROUTE
+        } else {
+            ROUTE_PROXIED
+        })
+    }
+    inner(addr).await.unwrap_or(ROUTE_UNKNOWN)
 }
 
 fn main() -> Result<()> {
@@ -296,64 +354,103 @@ fn main() -> Result<()> {
         }
     };
 
+    // Background: poll the admin status API and stash the active-route class in a
+    // shared atomic; the event loop reads it on a timer to recolour the icon
+    // (Direct = amber, NoRoute = blue) without ever blocking the UI thread on I/O.
+    let route = Arc::new(AtomicU8::new(ROUTE_UNKNOWN));
+    if let Some(addr) = supervisor.admin_addr {
+        let route = route.clone();
+        supervisor.rt.handle().spawn(async move {
+            let mut tick = tokio::time::interval(POLL_EVERY);
+            loop {
+                tick.tick().await;
+                route.store(fetch_route(addr).await, Ordering::Relaxed);
+            }
+        });
+    }
+
     let config_path = runic::paths::default_config_path();
 
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + POLL_EVERY);
 
-        if let tao::event::Event::UserEvent(menu_event) = event {
-            match menu_event.id {
-                id if id == start_i.id() => match supervisor.start() {
-                    Ok(()) => set_state(&tray, IconState::Running),
-                    Err(e) => {
-                        tracing::error!(error = %e, "start failed");
-                        set_state(&tray, IconState::Error);
+        match event {
+            // Periodic refresh: recolour the icon from the polled route. Stopped
+            // overrides everything; otherwise the active-route class picks the
+            // colour (Direct = amber / NoRoute = blue / proxied = teal).
+            tao::event::Event::NewEvents(
+                StartCause::ResumeTimeReached { .. } | StartCause::Init,
+            ) => {
+                let state = if !supervisor.is_running() {
+                    IconState::Stopped
+                } else {
+                    match route.load(Ordering::Relaxed) {
+                        ROUTE_DIRECT => IconState::Direct,
+                        ROUTE_NOROUTE => IconState::NoRoute,
+                        _ => IconState::Running,
                     }
-                },
-                id if id == stop_i.id() => {
-                    supervisor.stop();
-                    set_state(&tray, IconState::Stopped);
-                }
-                id if id == restart_i.id() => match supervisor.restart() {
-                    Ok(()) => set_state(&tray, IconState::Running),
-                    Err(e) => {
-                        tracing::error!(error = %e, "restart failed");
-                        set_state(&tray, IconState::Error);
-                    }
-                },
-                id if id == status_i.id() => {
-                    let state = if supervisor.is_running() { "running" } else { "stopped" };
-                    tracing::info!(%state, "status");
-                    // TODO: surface via a native Windows toast instead of a log line.
-                }
-                id if id == ip_i.id() => {
-                    // TODO: issue an internal request through the local SOCKS5 to
-                    // api.ipify.org on the tokio runtime and show the IP in a toast.
-                }
-                id if id == config_i.id() => {
-                    // TODO: open the YAML in the default editor
-                    // (std::process::Command "cmd /C start" on the config path).
-                    let _ = &config_path;
-                }
-                id if id == logs_i.id() => {
-                    // TODO: open the log file / a simple log window.
-                }
-                id if id == autostart_i.id() => {
-                    // Target the opposite of what's actually persisted, write it,
-                    // then force the checkmark to mirror reality so a failed write
-                    // never leaves the UI lying.
-                    let target = !autostart::is_enabled();
-                    if let Err(e) = autostart::set(target) {
-                        tracing::error!(error = %e, "autostart toggle failed");
-                    }
-                    autostart_i.set_checked(autostart::is_enabled());
-                }
-                id if id == quit_i.id() => {
-                    supervisor.stop();
-                    *control_flow = ControlFlow::Exit;
-                }
-                _ => {}
+                };
+                set_state(&tray, state);
             }
+            tao::event::Event::UserEvent(menu_event) => {
+                match menu_event.id {
+                    id if id == start_i.id() => match supervisor.start() {
+                        Ok(()) => set_state(&tray, IconState::Running),
+                        Err(e) => {
+                            tracing::error!(error = %e, "start failed");
+                            set_state(&tray, IconState::Error);
+                        }
+                    },
+                    id if id == stop_i.id() => {
+                        supervisor.stop();
+                        set_state(&tray, IconState::Stopped);
+                    }
+                    id if id == restart_i.id() => match supervisor.restart() {
+                        Ok(()) => set_state(&tray, IconState::Running),
+                        Err(e) => {
+                            tracing::error!(error = %e, "restart failed");
+                            set_state(&tray, IconState::Error);
+                        }
+                    },
+                    id if id == status_i.id() => {
+                        let state = if supervisor.is_running() {
+                            "running"
+                        } else {
+                            "stopped"
+                        };
+                        tracing::info!(%state, "status");
+                        // TODO: surface via a native Windows toast instead of a log line.
+                    }
+                    id if id == ip_i.id() => {
+                        // TODO: issue an internal request through the local SOCKS5 to
+                        // api.ipify.org on the tokio runtime and show the IP in a toast.
+                    }
+                    id if id == config_i.id() => {
+                        // TODO: open the YAML in the default editor
+                        // (std::process::Command "cmd /C start" on the config path).
+                        let _ = &config_path;
+                    }
+                    id if id == logs_i.id() => {
+                        // TODO: open the log file / a simple log window.
+                    }
+                    id if id == autostart_i.id() => {
+                        // Target the opposite of what's actually persisted, write it,
+                        // then force the checkmark to mirror reality so a failed write
+                        // never leaves the UI lying.
+                        let target = !autostart::is_enabled();
+                        if let Err(e) = autostart::set(target) {
+                            tracing::error!(error = %e, "autostart toggle failed");
+                        }
+                        autostart_i.set_checked(autostart::is_enabled());
+                    }
+                    id if id == quit_i.id() => {
+                        supervisor.stop();
+                        *control_flow = ControlFlow::Exit;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
         }
     });
 }
