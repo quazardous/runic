@@ -2,14 +2,13 @@
 #
 # STANDALONE crate on purpose: it is NOT a member of the root build, so the
 # Linux CLI build / `cargo test` at the repo root never touch it (its GUI deps
-# need Windows + GTK and aren't fetched on the Linux box). Build it ON WINDOWS:
+# need Windows and aren't fetched on the Linux box). Build it ON WINDOWS:
 #   cd runic-tray && cargo build --release
 # See ../docs/dev/windows-setup.md.
 #
-# NOTE: this crate was authored from the spec and has NOT been compiled here
-# (no Windows toolchain / no network for the GUI deps in the dev sandbox).
-# Treat it as a verified-on-Windows-required scaffold; pin/adjust dep versions
-# when you first build it.
+# Built and verified on Windows 11: the dep versions below (tao 0.30 /
+# tray-icon 0.19 / windows 0.58) compile and run on both the GNU and MSVC
+# toolchains.
 
 [package]
 name = "runic-tray"

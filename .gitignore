@@ -1,4 +1,6 @@
 /target
+# Standalone sibling crate (not a workspace member) — its build dir lives here.
+/runic-tray/target
 Cargo.lock.bak
 *.swp
 .DS_Store
