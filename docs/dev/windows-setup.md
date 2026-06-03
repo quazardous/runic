@@ -92,12 +92,28 @@ menu toggle so the user opts in.
 
 ## 5. Packaging
 
-- **MSI** via [`cargo-wix`](https://github.com/volks73/cargo-wix):
+- **Portable ZIP** (no extra tooling) — `packaging\windows\package.ps1` builds
+  the release exe and bundles it with a config template + README into
+  `dist\runic-tray-<version>-windows-x64.zip`:
   ```powershell
-  cargo install cargo-wix
-  cargo wix --package runic-tray
+  .\packaging\windows\package.ps1
   ```
-- or a **portable ZIP** of `runic-tray.exe` + a default `runic.yaml`.
+- **MSI** via [`cargo-wix`](https://github.com/volks73/cargo-wix) is tracked
+  separately (needs the WiX Toolset installed).
+
+### Executable icon
+
+The exe carries the Raidho rune (Explorer / alt-tab / installer). `runic.ico`
+is generated from the **same stroke geometry the tray paints at runtime** by
+`runic-tray\assets\gen_icon.py` (Pillow), and embedded via `runic.rc` +
+`build.rs` (the `embed-resource` crate). Regenerate after changing the rune:
+```powershell
+python runic-tray\assets\gen_icon.py
+```
+On the **GNU toolchain** the embed runs `windres`, which needs `gcc` + `windres`
+(the mingw64 bin) ahead on `PATH`; `package.ps1` prepends `C:\msys64\mingw64\bin`
+when present. Without it the build still succeeds but ships the generic icon. The
+MSVC toolchain uses `rc.exe` and needs no PATH tweak.
 
 ## 6. Cross-compiling from Linux (optional)
 
