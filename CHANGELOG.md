@@ -11,7 +11,16 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **`runic.exe` now works out of the box on Windows.** The CLI's default config
+  path and the persisted snapshot location are now platform-aware: they resolve
+  under `%APPDATA%\runic\` on Windows instead of Unix-only paths (which left a
+  bare `runic.exe` unable to find its config, and could drop the snapshot — with
+  cleartext credentials — into the current directory). Unix behaviour is
+  unchanged (`/etc/runic/runic.yaml` for the config, `$XDG_CONFIG_HOME` for the
+  snapshot). The resolver is shared with the Windows tray so the two never
+  diverge.
 
 ## [0.2.0] - 2026-06-02
 

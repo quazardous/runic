@@ -10,8 +10,10 @@ for the `runic-tray` app (the v1 Windows system-tray front-end). Linux users do
 
 ## 1. Toolchain
 
-runic uses the **MSVC** toolchain on Windows (the default, and what the tray
-GUI crates expect).
+**MSVC is required only for the tray** (`runic-tray`): its GUI crates (`tao`,
+`tray-icon`) expect the MSVC linker + Windows SDK. The **core CLI** (`runic.exe`)
+builds fine on either the GNU or the MSVC toolchain — pick MSVC if you intend to
+build the tray too, so you have a single toolchain.
 
 1. **Visual Studio Build Tools** — install the *Build Tools for Visual Studio*
    (or full VS Community) with the **"Desktop development with C++"** workload.

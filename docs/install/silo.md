@@ -171,6 +171,12 @@ port across idle periods.
   one config is exposed (rotate by opening a fresh silo and re-pushing).
 - The SOCKS5 and admin surfaces remain **loopback-only**; the silo adds
   encryption-at-rest and per-client isolation, not network exposure controls.
+- **Plain mode is different.** The non-silo `runic.snapshot.json` holds upstream
+  credentials *in clear*. At-rest it is only as protected as its directory: on
+  Unix runic writes it owner-only (`0600`); on Windows it lives under
+  `%APPDATA%\runic\`, which NTFS already restricts to the current user by
+  inheritance (no extra ACL is set). For a genuinely untrusted / seizable host,
+  use **silo mode** — that is the encrypted path; the clear snapshot is not.
 
 ## Not in scope
 

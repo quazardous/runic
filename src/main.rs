@@ -9,7 +9,7 @@ use clap::Parser;
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
-use runic::{admin, config, server, silo, store, watcher};
+use runic::{admin, config, paths, server, silo, store, watcher};
 
 /// How long a decrypted variation stays warm in RAM after its last use before the
 /// keep-alive cache evicts it (and drops its plaintext config from memory).
@@ -33,7 +33,9 @@ fn unix_now() -> u64 {
     about = "Local SOCKS5 proxy relaying via HTTP CONNECT upstream"
 )]
 struct Cli {
-    #[arg(short, long, default_value = "/etc/runic/runic.yaml")]
+    /// Path to the YAML config. Defaults to the platform config location:
+    /// `/etc/runic/runic.yaml` on Unix, `%APPDATA%\runic\runic.yaml` on Windows.
+    #[arg(short, long, default_value_os_t = paths::default_config_path())]
     config: PathBuf,
 
     #[arg(long, env = "RUNIC_LOG", default_value = "runic=info")]

@@ -6,11 +6,13 @@
 //! (`runic-tray`) is intended to be a second shell over the same core — hence
 //! the split into a `[lib]` target.
 //!
-//! Nothing here is platform-specific: it builds and is tested on Linux, and the
-//! same library is what a Windows tray front-end links against.
+//! The data plane is platform-agnostic; the few platform-specific bits (default
+//! file locations, owner-only permissions) are isolated — see [`paths`] for the
+//! `%APPDATA%`-vs-XDG default resolver shared with the tray.
 
 pub mod admin;
 pub mod config;
+pub mod paths;
 pub mod routing;
 pub mod server;
 pub mod silo;

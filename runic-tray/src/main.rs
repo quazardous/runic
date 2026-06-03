@@ -96,15 +96,6 @@ impl Supervisor {
     }
 }
 
-/// Default config path on Windows: %APPDATA%\runic\runic.yaml.
-fn default_config_path() -> PathBuf {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("runic")
-        .join("runic.yaml")
-}
-
 /// A 16x16 solid-teal placeholder icon. TODO: ship a proper .ico asset.
 fn placeholder_icon() -> Result<Icon> {
     let (w, h) = (16u32, 16u32);
@@ -123,7 +114,9 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let mut supervisor = Supervisor::new(default_config_path())?;
+    // Shared with the CLI: `%APPDATA%\runic\runic.yaml` on Windows (single
+    // source of truth in `runic::paths`, no divergent copy here).
+    let mut supervisor = Supervisor::new(runic::paths::default_config_path())?;
     // Auto-start the proxy on launch (the tray reflects state; user can Stop).
     if let Err(e) = supervisor.start() {
         tracing::error!(error = %e, "initial start failed");
