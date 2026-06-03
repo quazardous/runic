@@ -39,6 +39,14 @@ windows = { version = "0.58", features = [
     "Win32_System_Registry",
 ] }
 
+[build-dependencies]
+# Embed the executable icon (assets/runic.ico, via runic.rc) into the .exe
+# resource table so Explorer / alt-tab / the installer show the Raidho rune.
+# embed-resource links the compiled resource object directly (not through a
+# static archive), avoiding the GNU-linker dead-strip that drops a winres
+# resource. Still needs windres + gcc on PATH for the GNU toolchain. See build.rs.
+embed-resource = "2.5"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

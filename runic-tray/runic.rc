@@ -1,0 +1,4 @@
+// Windows resource script: set the executable icon.
+// Icon ID 1 (lowest) -> the one Explorer / alt-tab use as the app icon.
+// Compiled and embedded by build.rs via the embed-resource crate.
+1 ICON "assets/runic.ico"

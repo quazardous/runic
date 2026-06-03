@@ -1,0 +1,25 @@
+# runic config — copy this to %APPDATA%\runic\runic.yaml and edit.
+#
+# The tray reads %APPDATA%\runic\runic.yaml (NOT this file next to the exe).
+# An empty pool is valid: runic boots and declines sessions until an upstream is
+# pushed over the admin API. See the project docs for the full reference.
+
+listen:
+  addr: "127.0.0.1:1080"   # local SOCKS5 endpoint your apps point at
+  auth: none               # loopback only — no auth on the SOCKS5 surface
+
+admin:
+  addr: "127.0.0.1:7778"   # loopback admin API (hot config / status page)
+
+# Named upstream pool. Clients always hit the same loopback endpoint above;
+# runic decides which upstream the traffic exits through. Leave empty to boot
+# unconfigured and drive everything over the admin API.
+upstreams: {}
+
+#  default:
+#    kind: http_connect
+#    host: gw.example-provider.com
+#    port: 823
+#    auth:
+#      username_env: PROXY_LOGIN     # creds come from the environment, never the file
+#      password_env: PROXY_PASSWORD

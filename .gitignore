@@ -1,6 +1,8 @@
 /target
 # Standalone sibling crate (not a workspace member) — its build dir lives here.
 /runic-tray/target
+# Packaged release artifacts (built by packaging/windows/package.ps1).
+/dist
 Cargo.lock.bak
 *.swp
 .DS_Store
