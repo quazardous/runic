@@ -24,7 +24,7 @@ use tokio::task::JoinHandle;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 
-use runic::{admin, config, server, store, watcher};
+use runic::{admin, config, server, stats, store, watcher};
 
 /// Owns the tokio runtime and the running proxy tasks. Start spins the core up;
 /// Stop aborts the SOCKS5 server task.
@@ -34,6 +34,9 @@ struct Supervisor {
     /// App-lifetime config receiver, set by `boot` once the ConfigStore + watcher
     /// + admin listeners are up. Cloned into each server task.
     cfg_rx: Option<tokio::sync::watch::Receiver<Arc<config::Config>>>,
+    /// App-lifetime live session counters, shared by the admin status endpoint
+    /// and each SOCKS5 server task.
+    stats: Arc<stats::Stats>,
     server_task: Option<JoinHandle<()>>,
 }
 
@@ -46,6 +49,7 @@ impl Supervisor {
             rt,
             config_path,
             cfg_rx: None,
+            stats: stats::Stats::new(),
             server_task: None,
         })
     }
@@ -67,6 +71,7 @@ impl Supervisor {
             return Ok(());
         }
         let path = self.config_path.clone();
+        let stats = self.stats.clone();
         let cfg_rx = self.rt.block_on(async move {
             // NOTE: the tray runs the core in plain (non-silo) mode. Silo mode is
             // opt-in and adds the encrypted per-variation store + sweeper; wire it
@@ -78,7 +83,7 @@ impl Supervisor {
             let cfg_store = Arc::new(Mutex::new(cfg_store));
 
             watcher::spawn(path.clone(), cfg_store.clone())?;
-            admin::spawn(admin_cfg.addr, cfg_store.clone(), None).await?;
+            admin::spawn(admin_cfg.addr, cfg_store.clone(), None, stats).await?;
             Ok::<_, anyhow::Error>(cfg_rx)
         })?;
         self.cfg_rx = Some(cfg_rx);
@@ -98,8 +103,9 @@ impl Supervisor {
             .cfg_rx
             .clone()
             .expect("cfg_rx is set by boot() above");
+        let stats = self.stats.clone();
         let task = self.rt.handle().spawn(async move {
-            if let Err(e) = server::run(cfg_rx, None).await {
+            if let Err(e) = server::run(cfg_rx, None, stats).await {
                 tracing::error!(error = %e, "server exited with error");
             }
         });

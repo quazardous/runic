@@ -54,7 +54,8 @@ upstreams:
 
 | Method + path | Effect |
 | ------------- | ------ |
-| `GET /v1/status` | health, version, uptime, effective pool size |
+| `GET /` (also `/status`, `/index.html`) | the human status page — a self-contained HTML+JS view that polls `/v1/status` |
+| `GET /v1/status` | the live runtime view as JSON (see [Status surface](#status-surface)) |
 | `GET /v1/config` | merged effective config (cold ∪ snapshot ∪ hot) |
 | `GET /v1/diagnose` | per-upstream effective **source** (`cold` / `snapshot` / `hot`) |
 | `GET /v1/diff` | upstreams defined in more than one layer (what shadows what) |
@@ -66,6 +67,53 @@ upstreams:
 | `DELETE /v1/snapshot` | wipe the snapshot file; next boot = cold YAML only |
 | `PUT /v1/route/default` | point the default (no-provider) route at a named upstream — body `{"upstream":"<name>"}` (runtime only) |
 | `DELETE /v1/route/default` | clear the pointer; the default route falls back to the `default` entry |
+
+## Status surface
+
+`GET /v1/status` returns the **live runtime view** — the current effective route,
+the hot upstream layer, live session counters, and (when silo mode is on) each
+variation with its own counters. A small self-contained HTML page at `GET /`
+consumes this same endpoint and paints it (auto-refreshing); it ships no external
+assets and talks only to the loopback admin port.
+
+```json
+{
+  "status": "ok",
+  "version": "0.2.0",
+  "uptime_secs": 1234,
+  "pool_size": 1,
+  "listen": "127.0.0.1:7777",
+  "active_route": { "name": "dataimpulse-fr", "kind": "http_connect" },
+  "any_active_direct": false,
+  "active_sessions": 2,
+  "requests_total": 57,
+  "upstreams_hot": [ { "name": "lab", "kind": "direct" } ],
+  "silo": {
+    "enabled": true,
+    "auth": "none",
+    "variations": [
+      { "id": "71c080ed2515", "warm": true,
+        "route": { "name": "default", "kind": "http_connect" },
+        "connections": 2, "requests": 57,
+        "last_access_secs": 0, "ttl_secs_remaining": 604800 }
+    ]
+  }
+}
+```
+
+- `active_route` — the upstream a no-provider session resolves to right now
+  (`null` for an empty / default-less pool), with its **kind**.
+- `any_active_direct` — `true` iff at least one **active** session is routing
+  through a `kind: direct` upstream (local IP exposed). The conservative "is any
+  traffic leaking right now?" signal — a declared-but-unused `direct` upstream
+  does **not** trip it.
+- `upstreams_hot` — only the **hot** layer (runtime-pushed), not the cold YAML.
+- `silo.variations[]` — one row per variation, read entirely from the cleartext
+  index + RAM counters: **no token, no decryption**. `connections` is the live
+  active-session gauge; `requests` is cumulative (survives idle eviction).
+  `route` is resolved only while the variation is warm (`null` when cold —
+  a cold variation has no live sessions, so it cannot leak). Viewing the status
+  never extends a variation's lifetime.
 
 ### Upstream body
 

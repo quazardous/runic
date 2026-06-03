@@ -9,7 +9,7 @@ use clap::Parser;
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
-use runic::{admin, config, paths, server, silo, store, watcher};
+use runic::{admin, config, paths, server, silo, stats, store, watcher};
 
 /// How long a decrypted variation stays warm in RAM after its last use before the
 /// keep-alive cache evicts it (and drops its plaintext config from memory).
@@ -75,10 +75,14 @@ async fn main() -> Result<()> {
     let (config_store, cfg_rx) = store::ConfigStore::new(cfg, snapshot_path);
     let config_store = Arc::new(Mutex::new(config_store));
 
+    // Live session counters, shared by the data plane (writer) and the admin
+    // status endpoint (reader).
+    let stats = stats::Stats::new();
+
     // Silo runtime: the `none`-mode port registry + the admin handle, plus a
     // background sweeper that evicts idle variations and tears down their ports.
     let silo_admin = silo.as_ref().map(|(cache, mode)| {
-        let ports = server::SiloPorts::new(cfg_rx.clone(), cache.clone());
+        let ports = server::SiloPorts::new(cfg_rx.clone(), cache.clone(), stats.clone());
         admin::SiloAdmin {
             cache: cache.clone(),
             ports,
@@ -107,8 +111,14 @@ async fn main() -> Result<()> {
     }
 
     watcher::spawn(cli.config.clone(), config_store.clone())?;
-    admin::spawn(admin_cfg.addr, config_store.clone(), silo_admin).await?;
+    admin::spawn(
+        admin_cfg.addr,
+        config_store.clone(),
+        silo_admin,
+        stats.clone(),
+    )
+    .await?;
 
     let server_silo = silo.map(|(cache, _)| cache);
-    server::run(cfg_rx, server_silo).await
+    server::run(cfg_rx, server_silo, stats).await
 }

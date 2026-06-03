@@ -247,6 +247,12 @@ impl ConfigStore {
         merge(&self.cold, &self.snapshot, &self.hot, &self.active_route)
     }
 
+    /// The **hot** layer only (runtime-pushed, RAM-only upstreams). The status
+    /// surface shows this — the live runtime view, not the cold YAML base.
+    pub fn hot(&self) -> &BTreeMap<String, Upstream> {
+        &self.hot
+    }
+
     /// Set (or clear with `None`) the active-route pointer and republish.
     /// Runtime only — not persisted to the snapshot. `None` falls back to the
     /// entry named `default`.

@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<!--
+  runic status page — self-contained (no external assets, no CDN, no network
+  beyond same-origin /v1/status). Served by the loopback admin API at `/`.
+  Polls /v1/status and paints it; click a silo variation for its live counters.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>runic ᚱ status</title>
+<style>
+  :root {
+    --teal: #149e9e; --amber: #e08a16; --blue: #3b82f6; --red: #d63b3b;
+    --bg: #0e1413; --panel: #16201f; --line: #243230; --fg: #d7e2e0; --dim: #7e918e;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  header { display: flex; align-items: baseline; gap: .6rem; padding: 1rem 1.25rem;
+           border-bottom: 1px solid var(--line); }
+  header .rune { color: var(--teal); font-size: 1.6rem; }
+  header h1 { margin: 0; font-size: 1.05rem; font-weight: 600; letter-spacing: .03em; }
+  header .ver { color: var(--dim); }
+  header .conn { margin-left: auto; color: var(--dim); font-size: .85rem; }
+  main { padding: 1.25rem; max-width: 980px; margin: 0 auto; }
+  .banner { padding: .7rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-weight: 600; display: none; }
+  .banner.warn { display: block; background: rgba(224,138,22,.13); color: var(--amber);
+                 border: 1px solid var(--amber); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .75rem; margin-bottom: 1.5rem; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: .8rem .9rem; }
+  .card .k { color: var(--dim); font-size: .75rem; text-transform: uppercase; letter-spacing: .05em; }
+  .card .v { font-size: 1.3rem; margin-top: .15rem; }
+  h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; color: var(--dim);
+       border-bottom: 1px solid var(--line); padding-bottom: .35rem; margin: 1.5rem 0 .6rem; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: .45rem .5rem; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 500; font-size: .75rem; text-transform: uppercase; }
+  tbody tr.silo { cursor: pointer; }
+  tbody tr.silo:hover { background: rgba(20,158,158,.07); }
+  tbody tr.sel { background: rgba(20,158,158,.13); }
+  .pill { display: inline-block; padding: .1rem .5rem; border-radius: 999px; font-size: .75rem; border: 1px solid; }
+  .k-http_connect { color: var(--teal); border-color: var(--teal); }
+  .k-direct { color: var(--amber); border-color: var(--amber); }
+  .warm-yes { color: var(--teal); } .warm-no { color: var(--dim); }
+  .none { color: var(--dim); }
+  .detail { margin-top: .75rem; background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+            padding: 1rem; display: none; }
+  .detail.show { display: flex; gap: 2.5rem; align-items: center; }
+  .detail .big { font-size: 2.2rem; color: var(--teal); }
+  .detail .lbl { color: var(--dim); font-size: .8rem; }
+  .detail .vid { margin-left: auto; color: var(--dim); }
+  footer { color: var(--dim); font-size: .8rem; text-align: center; padding: 1rem; }
+  .err { color: var(--red); }
+</style>
+</head>
+<body>
+<header>
+  <span class="rune">ᚱ</span>
+  <h1>runic</h1>
+  <span class="ver" id="ver"></span>
+  <span class="conn" id="conn">connecting…</span>
+</header>
+<main>
+  <div class="banner" id="leak">⚠ IP EXPOSED — at least one active session is routing <b>direct</b> (no upstream proxy).</div>
+
+  <div class="grid">
+    <div class="card"><div class="k">Listen</div><div class="v" id="listen">—</div></div>
+    <div class="card"><div class="k">Active route</div><div class="v" id="route">—</div></div>
+    <div class="card"><div class="k">Active sessions</div><div class="v" id="sessions">—</div></div>
+    <div class="card"><div class="k">Requests total</div><div class="v" id="requests">—</div></div>
+    <div class="card"><div class="k">Uptime</div><div class="v" id="uptime">—</div></div>
+  </div>
+
+  <h2>Hot upstreams</h2>
+  <table><thead><tr><th>Name</th><th>Kind</th></tr></thead><tbody id="hot"></tbody></table>
+
+  <section id="silo-sec" style="display:none">
+    <h2>Silo variations <span id="silo-auth" class="none"></span></h2>
+    <table><thead><tr>
+      <th>Variation</th><th>State</th><th>Route</th><th>Connections</th><th>Requests</th><th>Idle</th><th>TTL left</th>
+    </tr></thead><tbody id="silo"></tbody></table>
+    <div class="detail" id="detail">
+      <div><div class="big" id="d-conn">0</div><div class="lbl">connections</div></div>
+      <div><div class="big" id="d-req">0</div><div class="lbl">requests</div></div>
+      <div class="vid">variation <span id="d-id"></span></div>
+    </div>
+  </section>
+</main>
+<footer>runic status · auto-refresh 2s · loopback admin API</footer>
+
+<script>
+"use strict";
+var selected = null; // selected variation id (detail panel)
+
+function fmtDur(s) {
+  s = Math.max(0, s | 0);
+  if (s < 60) return s + "s";
+  if (s < 3600) return (s / 60 | 0) + "m " + (s % 60) + "s";
+  if (s < 86400) return (s / 3600 | 0) + "h " + ((s % 3600) / 60 | 0) + "m";
+  return (s / 86400 | 0) + "d " + ((s % 86400) / 3600 | 0) + "h";
+}
+function kindPill(k) {
+  if (!k) return '<span class="none">—</span>';
+  return '<span class="pill k-' + k + '">' + k + '</span>';
+}
+function routeCell(r) {
+  if (!r) return '<span class="none">no route</span>';
+  return r.name + ' ' + kindPill(r.kind);
+}
+function el(id) { return document.getElementById(id); }
+
+function paint(d) {
+  el("conn").textContent = "live";
+  el("conn").classList.remove("err");
+  el("ver").textContent = "v" + (d.version || "?");
+  el("listen").textContent = d.listen || "—";
+  el("route").innerHTML = d.active_route
+    ? d.active_route.name + ' ' + kindPill(d.active_route.kind)
+    : '<span class="none">none</span>';
+  el("sessions").textContent = d.active_sessions;
+  el("requests").textContent = d.requests_total;
+  el("uptime").textContent = fmtDur(d.uptime_secs);
+  el("leak").className = "banner" + (d.any_active_direct ? " warn" : "");
+
+  var hot = el("hot");
+  hot.innerHTML = "";
+  (d.upstreams_hot || []).forEach(function (u) {
+    var tr = document.createElement("tr");
+    tr.innerHTML = "<td>" + u.name + "</td><td>" + kindPill(u.kind) + "</td>";
+    hot.appendChild(tr);
+  });
+  if (!(d.upstreams_hot || []).length) {
+    hot.innerHTML = '<tr><td colspan="2" class="none">empty (configure via the admin API)</td></tr>';
+  }
+
+  var sec = el("silo-sec");
+  if (!d.silo || !d.silo.enabled) { sec.style.display = "none"; return; }
+  sec.style.display = "";
+  el("silo-auth").textContent = "· bind: " + d.silo.auth;
+
+  var body = el("silo"), vars = d.silo.variations || [], seen = {};
+  body.innerHTML = "";
+  vars.forEach(function (v) {
+    seen[v.id] = v;
+    var tr = document.createElement("tr");
+    tr.className = "silo" + (v.id === selected ? " sel" : "");
+    tr.innerHTML =
+      "<td>" + v.id + "</td>" +
+      '<td class="warm-' + (v.warm ? "yes" : "no") + '">' + (v.warm ? "warm" : "cold") + "</td>" +
+      "<td>" + routeCell(v.route) + "</td>" +
+      "<td>" + v.connections + "</td>" +
+      "<td>" + v.requests + "</td>" +
+      "<td>" + fmtDur(v.last_access_secs) + "</td>" +
+      "<td>" + fmtDur(v.ttl_secs_remaining) + "</td>";
+    tr.onclick = function () { selected = (selected === v.id) ? null : v.id; paint(d); };
+    body.appendChild(tr);
+  });
+  if (!vars.length) body.innerHTML = '<tr><td colspan="7" class="none">no variations yet</td></tr>';
+
+  var det = el("detail");
+  if (selected && seen[selected]) {
+    var v = seen[selected];
+    el("d-conn").textContent = v.connections;
+    el("d-req").textContent = v.requests;
+    el("d-id").textContent = v.id;
+    det.className = "detail show";
+  } else {
+    det.className = "detail";
+    selected = null;
+  }
+}
+
+function tick() {
+  fetch("/v1/status", { cache: "no-store" })
+    .then(function (r) { return r.json(); })
+    .then(paint)
+    .catch(function () {
+      var c = el("conn"); c.textContent = "offline"; c.classList.add("err");
+    });
+}
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>

@@ -24,9 +24,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{SiloAuth, UpstreamSpec};
+use crate::config::{Config, SiloAuth, UpstreamKind, UpstreamSpec, DEFAULT_UPSTREAM_NAME};
 use crate::server::SiloPorts;
-use crate::silo::VariationCache;
+use crate::silo::{VariationCache, VariationData};
+use crate::stats::Stats;
 use crate::store::ConfigStore;
 
 /// Everything the admin API needs to serve silo requests: the variation cache,
@@ -48,6 +49,7 @@ pub async fn spawn(
     addr: SocketAddr,
     store: Arc<Mutex<ConfigStore>>,
     silo: Option<SiloAdmin>,
+    stats: Arc<Stats>,
 ) -> Result<SocketAddr> {
     let listener = TcpListener::bind(addr)
         .await
@@ -61,8 +63,9 @@ pub async fn spawn(
                 Ok((sock, peer)) => {
                     let store = store.clone();
                     let silo = silo.clone();
+                    let stats = stats.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_conn(sock, store, silo, started).await {
+                        if let Err(e) = handle_conn(sock, store, silo, stats, started).await {
                             debug!(%peer, error = %e, "admin connection error");
                         }
                     });
@@ -87,6 +90,7 @@ async fn handle_conn(
     mut sock: TcpStream,
     store: Arc<Mutex<ConfigStore>>,
     silo: Option<SiloAdmin>,
+    stats: Arc<Stats>,
     started: Instant,
 ) -> Result<()> {
     let req = match read_request(&mut sock).await {
@@ -98,7 +102,7 @@ async fn handle_conn(
         }
     };
 
-    let resp = route(&req, &store, &silo, started).await;
+    let resp = route(&req, &store, &silo, &stats, started).await;
     sock.write_all(&resp)
         .await
         .context("write admin response")?;
@@ -110,24 +114,18 @@ async fn route(
     req: &Request,
     store: &Arc<Mutex<ConfigStore>>,
     silo: &Option<SiloAdmin>,
+    stats: &Arc<Stats>,
     started: Instant,
 ) -> Vec<u8> {
     let permanent = query_flag(&req.query, "permanent");
 
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/v1/status") => {
-            let store = store.lock().await;
-            json_response(
-                200,
-                "OK",
-                &json!({
-                    "status": "ok",
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "uptime_secs": started.elapsed().as_secs(),
-                    "pool_size": store.pool_size(),
-                }),
-            )
+        // The human-facing status page (self-contained HTML+JS, consumes
+        // `/v1/status`). Served on the same loopback admin port.
+        ("GET", "/") | ("GET", "/status") | ("GET", "/index.html") => {
+            html_response(200, "OK", include_str!("ui/status.html"))
         }
+        ("GET", "/v1/status") => status_response(store, silo, stats, started).await,
         ("GET", "/v1/config") => {
             // Silo mode + Bearer ⇒ show that variation's own config (the warm-boot
             // "is my pool already populated?" check), not the global store.
@@ -442,6 +440,155 @@ fn json_response(code: u16, reason: &str, body: &serde_json::Value) -> Vec<u8> {
     out
 }
 
+fn html_response(code: u16, reason: &str, body: &str) -> Vec<u8> {
+    let mut out = format!(
+        "HTTP/1.1 {code} {reason}\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    out.extend_from_slice(body.as_bytes());
+    out
+}
+
+/// Build the enriched `GET /v1/status` body: the **live runtime view** —
+/// version, uptime, listen, the active route, the hot upstream pool, live session
+/// counters, and the silo variations with per-variation connections/requests. All
+/// from cleartext index metadata + RAM counters: **no token, no decryption**.
+async fn status_response(
+    store: &Arc<Mutex<ConfigStore>>,
+    silo: &Option<SiloAdmin>,
+    stats: &Arc<Stats>,
+    started: Instant,
+) -> Vec<u8> {
+    let snap = stats.snapshot();
+    let (merged, hot) = {
+        let s = store.lock().await;
+        (s.merged(), s.hot().clone())
+    };
+
+    let active_route =
+        route_named(&merged).map(|(name, kind)| json!({ "name": name, "kind": kind }));
+
+    let upstreams_hot: Vec<_> = hot
+        .iter()
+        .map(|(name, up)| json!({ "name": name, "kind": up.kind }))
+        .collect();
+
+    let silo_json = match silo {
+        None => json!({ "enabled": false }),
+        Some(sa) => {
+            let now = unix_now();
+            let cache = sa.cache.lock().await;
+            let ttl = cache.store().ttl_secs();
+            let variations: Vec<_> = cache
+                .store()
+                .variations_meta()
+                .into_iter()
+                .map(|m| {
+                    let warm = cache.is_warm(&m.id);
+                    // Per-variation route (name + kind) is only knowable while the
+                    // variation is warm (its pool is decrypted in RAM); a cold
+                    // variation has no live sessions, so it cannot be leaking.
+                    let route = if warm {
+                        cache
+                            .warm_data(&m.id)
+                            .and_then(|d| variation_route(&merged, &d))
+                            .map(|(name, kind)| json!({ "name": name, "kind": kind }))
+                    } else {
+                        None
+                    };
+                    let vs = snap.variation(&m.id);
+                    let idle = now.saturating_sub(m.last_access);
+                    json!({
+                        "id": short_id(&m.id),
+                        "warm": warm,
+                        "route": route,
+                        "connections": vs.active,
+                        "requests": vs.requests,
+                        "last_access_secs": idle,
+                        "ttl_secs_remaining": ttl.saturating_sub(idle),
+                    })
+                })
+                .collect();
+            json!({
+                "enabled": true,
+                "auth": silo_auth_str(sa.default_mode),
+                "variations": variations,
+            })
+        }
+    };
+
+    json_response(
+        200,
+        "OK",
+        &json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_secs": started.elapsed().as_secs(),
+            // Kept for back-compat (existing consumers read it); counts the merged
+            // effective pool. The new fields below are the live runtime view.
+            "pool_size": merged.upstreams.len(),
+            "listen": merged.listen.addr.to_string(),
+            "active_route": active_route,
+            // Conservative leak signal for the tray icon: true iff ≥1 active
+            // session is routing through a `direct` upstream (local IP exposed).
+            "any_active_direct": snap.any_active_direct(),
+            "active_sessions": snap.active_total,
+            "requests_total": snap.requests_total,
+            "upstreams_hot": upstreams_hot,
+            "silo": silo_json,
+        }),
+    )
+}
+
+/// The no-hint ("default") route's `(name, kind)` for a config — mirrors
+/// [`crate::routing::pick_upstream`]`(cfg, None)`: the active-route pointer if it
+/// resolves, else the entry named `default`, else `None` (empty / default-less).
+fn route_named(cfg: &Config) -> Option<(String, UpstreamKind)> {
+    let name = cfg
+        .active_route
+        .as_ref()
+        .filter(|n| cfg.upstreams.contains_key(n.as_str()))
+        .cloned()
+        .or_else(|| {
+            cfg.upstreams
+                .contains_key(DEFAULT_UPSTREAM_NAME)
+                .then(|| DEFAULT_UPSTREAM_NAME.to_string())
+        })?;
+    let kind = cfg.upstreams.get(&name)?.kind;
+    Some((name, kind))
+}
+
+/// The route a silo variation takes for a no-hint session: resolved over the
+/// **hot/cold pool ∪ the variation's own pool** (the variation wins on a clash),
+/// same overlay the data plane's `pick_from_merged` uses.
+fn variation_route(merged: &Config, data: &VariationData) -> Option<(String, UpstreamKind)> {
+    let mut pool = merged.upstreams.clone();
+    pool.extend(data.upstreams.clone());
+    let cfg = Config {
+        listen: merged.listen.clone(),
+        upstreams: pool,
+        active_route: merged.active_route.clone(),
+    };
+    route_named(&cfg)
+}
+
+fn silo_auth_str(mode: SiloAuth) -> &'static str {
+    match mode {
+        SiloAuth::Rfc1929 => "rfc1929",
+        SiloAuth::None => "none",
+    }
+}
+
+/// Short, display-friendly form of a variation id (the full id is `SHA256(token)`
+/// hex; 12 hex chars is plenty to tell variations apart on the status page).
+fn short_id(id: &str) -> String {
+    id.chars().take(12).collect()
+}
+
 async fn read_request(sock: &mut TcpStream) -> Result<Request> {
     // Read until end of headers.
     let mut buf = Vec::with_capacity(1024);
@@ -561,12 +708,14 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let started = Instant::now();
+        let stats = crate::stats::Stats::new();
         tokio::spawn(async move {
             loop {
                 let (sock, _) = listener.accept().await.unwrap();
                 let store = store.clone();
+                let stats = stats.clone();
                 tokio::spawn(async move {
-                    let _ = handle_conn(sock, store, None, started).await;
+                    let _ = handle_conn(sock, store, None, stats, started).await;
                 });
             }
         });
@@ -590,7 +739,8 @@ mod tests {
             crate::silo::SiloStore::open(dir.path().join("runic.silo"), 3600).unwrap(),
             3600,
         )));
-        let ports = SiloPorts::new(cfg_rx, cache.clone());
+        let stats = crate::stats::Stats::new();
+        let ports = SiloPorts::new(cfg_rx, cache.clone(), stats.clone());
         let silo = Some(SiloAdmin {
             cache,
             ports,
@@ -605,8 +755,9 @@ mod tests {
                 let (sock, _) = listener.accept().await.unwrap();
                 let store = store.clone();
                 let silo = silo.clone();
+                let stats = stats.clone();
                 tokio::spawn(async move {
-                    let _ = handle_conn(sock, store, silo, started).await;
+                    let _ = handle_conn(sock, store, silo, stats, started).await;
                 });
             }
         });
@@ -657,6 +808,71 @@ mod tests {
         assert_eq!(code, 200);
         assert!(body.contains("\"pool_size\":1"), "got: {body}");
         assert!(body.contains("\"status\":\"ok\""), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn status_exposes_live_runtime_fields() {
+        let (addr, _dir) = test_server().await;
+        let (code, body) = http(
+            addr,
+            "GET /v1/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(code, 200);
+        // The cold `default` upstream is the resolved active route (http_connect).
+        assert!(body.contains("\"active_route\""), "got: {body}");
+        assert!(body.contains("\"name\":\"default\""), "got: {body}");
+        assert!(body.contains("\"kind\":\"http_connect\""), "got: {body}");
+        // Live counters, fresh instance.
+        assert!(body.contains("\"any_active_direct\":false"), "got: {body}");
+        assert!(body.contains("\"active_sessions\":0"), "got: {body}");
+        assert!(body.contains("\"requests_total\":0"), "got: {body}");
+        // No upstream has been pushed at runtime → hot layer is empty.
+        assert!(body.contains("\"upstreams_hot\":[]"), "got: {body}");
+        // No silo on this instance.
+        assert!(body.contains("\"silo\":{\"enabled\":false}"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn serves_self_contained_html_status_page() {
+        let (addr, _dir) = test_server().await;
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        sock.read_to_end(&mut resp).await.unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "got: {text}");
+        assert!(
+            text.contains("Content-Type: text/html"),
+            "expected html content-type"
+        );
+        // Self-contained: the page references the API and carries no external asset.
+        assert!(text.contains("/v1/status"), "page should consume the API");
+        assert!(!text.contains("http://") && !text.contains("https://"));
+    }
+
+    #[tokio::test]
+    async fn status_lists_silo_variations_without_token() {
+        let (addr, _d) = test_server_with_silo(SiloAuth::None).await;
+        // Open a variation (none-mode → mints a token + warms it).
+        let (code, body) = http(addr, &post_silo_open(None)).await;
+        assert_eq!(code, 200, "got: {body}");
+
+        let (code, body) = http(
+            addr,
+            "GET /v1/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert!(body.contains("\"enabled\":true"), "got: {body}");
+        assert!(body.contains("\"auth\":\"none\""), "got: {body}");
+        // The warm variation is listed with zeroed live counters — no token, no
+        // decryption needed to report it.
+        assert!(body.contains("\"warm\":true"), "got: {body}");
+        assert!(body.contains("\"connections\":0"), "got: {body}");
+        assert!(body.contains("\"requests\":0"), "got: {body}");
     }
 
     #[tokio::test]
@@ -909,9 +1125,14 @@ mod tests {
         let (store, _rx) = ConfigStore::new(cold, dir.path().join("runic.snapshot.json"));
         let store = Arc::new(Mutex::new(store));
 
-        let addr = spawn("127.0.0.1:0".parse().unwrap(), store, None)
-            .await
-            .unwrap();
+        let addr = spawn(
+            "127.0.0.1:0".parse().unwrap(),
+            store,
+            None,
+            crate::stats::Stats::new(),
+        )
+        .await
+        .unwrap();
         let (code, body) = http(
             addr,
             "GET /v1/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",

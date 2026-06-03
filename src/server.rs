@@ -11,6 +11,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, ListenAuth, Upstream, UpstreamKind};
 use crate::silo::{VariationCache, VariationData};
+use crate::stats::Stats;
 use crate::upstream;
 
 const SOCKS5_VERSION: u8 = 0x05;
@@ -31,6 +32,7 @@ const REPLY_ATYP_NOT_SUPPORTED: u8 = 0x08;
 pub async fn run(
     mut cfg_rx: watch::Receiver<Arc<Config>>,
     silo: Option<Arc<Mutex<VariationCache>>>,
+    stats: Arc<Stats>,
 ) -> Result<()> {
     let initial = cfg_rx.borrow().clone();
     let mut current_addr = initial.listen.addr;
@@ -57,8 +59,9 @@ pub async fn run(
                 };
                 let session_cfg = cfg_rx.borrow().clone();
                 let silo = silo.clone();
+                let stats = stats.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve(client, &session_cfg, &silo, None).await {
+                    if let Err(e) = serve(client, &session_cfg, &silo, None, &stats).await {
                         warn!(%peer, error = %e, "session ended with error");
                     }
                 });
@@ -98,6 +101,7 @@ pub struct SiloPorts {
     inner: Mutex<HashMap<String, BoundPort>>,
     cfg_rx: watch::Receiver<Arc<Config>>,
     cache: Arc<Mutex<VariationCache>>,
+    stats: Arc<Stats>,
 }
 
 struct BoundPort {
@@ -109,11 +113,13 @@ impl SiloPorts {
     pub fn new(
         cfg_rx: watch::Receiver<Arc<Config>>,
         cache: Arc<Mutex<VariationCache>>,
+        stats: Arc<Stats>,
     ) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(HashMap::new()),
             cfg_rx,
             cache,
+            stats,
         })
     }
 
@@ -147,8 +153,9 @@ impl SiloPorts {
                     let cfg = self.cfg_rx.borrow().clone();
                     let cache = Some(self.cache.clone());
                     let id = id.clone();
+                    let stats = self.stats.clone();
                     tokio::spawn(async move {
-                        let _ = serve(client, &cfg, &cache, Some(&id)).await;
+                        let _ = serve(client, &cfg, &cache, Some(&id), &stats).await;
                     });
                 }
             }
@@ -206,6 +213,7 @@ async fn serve(
     cfg: &Config,
     silo: &Option<Arc<Mutex<VariationCache>>>,
     port_variation_id: Option<&str>,
+    stats: &Arc<Stats>,
 ) -> Result<()> {
     let creds = negotiate_method(&mut client, &cfg.listen.auth).await?;
     let (host, port) = parse_request(&mut client).await?;
@@ -219,22 +227,28 @@ async fn serve(
     // Resolve the upstream for this session (owned). In silo mode the SOCKS5
     // password carries the silo token; on a `none`-mode dedicated port the
     // variation is fixed by id (no token); otherwise routing is by the username.
-    let chosen_upstream = match resolve_route(cfg, silo, creds.as_ref(), port_variation_id).await {
-        Some(u) => u,
-        None => {
-            // No matching route: empty pool, unknown provider/silo-token, or no
-            // `default`. Fail the session cleanly rather than panicking — the
-            // normal state for an API-driven runic before a route is pushed.
-            warn!(
-                %host,
-                port,
-                socks5_user = creds.as_ref().map(|c| c.username.as_str()).unwrap_or(""),
-                "no route for session — refusing CONNECT"
-            );
-            reply(&mut client, REPLY_GENERAL_FAILURE).await?;
-            return Ok(());
-        }
-    };
+    let (chosen_upstream, variation_id) =
+        match resolve_route(cfg, silo, creds.as_ref(), port_variation_id).await {
+            Some(r) => r,
+            None => {
+                // No matching route: empty pool, unknown provider/silo-token, or no
+                // `default`. Fail the session cleanly rather than panicking — the
+                // normal state for an API-driven runic before a route is pushed.
+                warn!(
+                    %host,
+                    port,
+                    socks5_user = creds.as_ref().map(|c| c.username.as_str()).unwrap_or(""),
+                    "no route for session — refusing CONNECT"
+                );
+                reply(&mut client, REPLY_GENERAL_FAILURE).await?;
+                return Ok(());
+            }
+        };
+
+    // Live counters for the status surface: mark this session active for its
+    // variation (if any) and flag it as a leak if the chosen upstream is
+    // `kind: direct`. The guard decrements the active gauges on drop (session end).
+    let _session = stats.begin(chosen_upstream.kind, variation_id);
 
     let mut upstream_stream = match upstream::connect(&chosen_upstream, &host, port).await {
         Ok(s) => s,
@@ -259,19 +273,22 @@ async fn serve(
     Ok(())
 }
 
-/// Resolve this session's upstream to an owned value, or `None` for no route.
+/// Resolve this session's upstream + the variation id it routes through (for the
+/// live stats), or `None` for no route.
 ///
-/// - **non-silo**: pick from the live pool by the SOCKS5 username (`provider=…`).
+/// - **non-silo**: pick from the live pool by the SOCKS5 username (`provider=…`);
+///   no variation (`None`).
 /// - **silo (rfc1929)**: the SOCKS5 **password** is the silo token. Open its
 ///   variation and route over the **cold pool ∪ that variation's pool** (the
 ///   variation wins on a name clash). An absent or unknown token ⇒ `None`
 ///   (`silo_token_unknown`, surfaced to the client as a clean SOCKS5 failure).
+/// - **silo (none-mode port)**: the variation is fixed by the port's id.
 async fn resolve_route(
     cfg: &Config,
     silo: &Option<Arc<Mutex<VariationCache>>>,
     creds: Option<&UserPass>,
     port_variation_id: Option<&str>,
-) -> Option<Upstream> {
+) -> Option<(Upstream, Option<String>)> {
     let user = creds.map(|c| c.username.as_str());
 
     // `none`-mode dedicated port: the variation is fixed by id, served from the
@@ -279,18 +296,23 @@ async fn resolve_route(
     if let Some(id) = port_variation_id {
         let cache = silo.as_ref()?;
         let data = cache.lock().await.peek_warm(id, unix_now())?;
-        return pick_from_merged(cfg, data, user);
+        let up = pick_from_merged(cfg, data, user)?;
+        return Some((up, Some(id.to_string())));
     }
 
     match silo {
-        None => crate::routing::pick_upstream(cfg, user).cloned(),
+        None => crate::routing::pick_upstream(cfg, user)
+            .cloned()
+            .map(|up| (up, None)),
         Some(cache) => {
             // rfc1929: the SOCKS5 password is the silo token.
             let token = creds
                 .map(|c| c.password.as_str())
                 .filter(|p| !p.is_empty())?;
+            let id = VariationCache::id_of(token);
             let data = cache.lock().await.access(token, unix_now()).ok()?;
-            pick_from_merged(cfg, data, user)
+            let up = pick_from_merged(cfg, data, user)?;
+            Some((up, id))
         }
     }
 }
@@ -722,7 +744,7 @@ mod tests {
         let (_tx, rx) = watch::channel(Arc::new(cfg));
 
         tokio::spawn(async move {
-            let _ = run(rx, None).await;
+            let _ = run(rx, None, Stats::new()).await;
         });
         wait_until_listening(listen_addr).await;
 
@@ -736,6 +758,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn e2e_routed_session_increments_live_stats() {
+        let upstream_addr = spawn_mock_upstream(MockBehavior::Echo, "u", "p").await;
+        let listen_addr = pick_free_port();
+        let cfg = cfg_for(listen_addr, upstream_addr, "u", "p");
+        let (_tx, rx) = watch::channel(Arc::new(cfg));
+
+        // Share the Stats handle with the server so we can read it back.
+        let stats = Stats::new();
+        let server_stats = stats.clone();
+        tokio::spawn(async move {
+            let _ = run(rx, None, server_stats).await;
+        });
+        wait_until_listening(listen_addr).await;
+
+        assert_eq!(stats.snapshot().requests_total, 0);
+
+        let tunnel = socks5_connect(listen_addr, "any.target.example", 443)
+            .await
+            .expect("CONNECT should succeed");
+        // By the time the client has its SOCKS5 success reply, the session has
+        // been counted (begin() runs before the reply).
+        let snap = stats.snapshot();
+        assert_eq!(snap.requests_total, 1, "one routed session = one request");
+        assert_eq!(snap.active_total, 1, "session still open");
+        // The default upstream is http_connect, so no leak.
+        assert!(!snap.any_active_direct());
+
+        // Closing the tunnel releases the active gauge (cumulative stays).
+        drop(tunnel);
+        // Give the server task a moment to drop its SessionGuard.
+        for _ in 0..50 {
+            if stats.snapshot().active_total == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let snap = stats.snapshot();
+        assert_eq!(snap.active_total, 0, "active gauge released on session end");
+        assert_eq!(snap.requests_total, 1, "cumulative request count stays");
+    }
+
+    #[tokio::test]
     async fn e2e_upstream_407_surfaces_as_socks5_general_failure() {
         let upstream_addr = spawn_mock_upstream(MockBehavior::AuthRefused, "", "").await;
         let listen_addr = pick_free_port();
@@ -743,7 +807,7 @@ mod tests {
         let (_tx, rx) = watch::channel(Arc::new(cfg));
 
         tokio::spawn(async move {
-            let _ = run(rx, None).await;
+            let _ = run(rx, None, Stats::new()).await;
         });
         wait_until_listening(listen_addr).await;
 
@@ -823,7 +887,7 @@ mod tests {
         );
         let (_tx, rx) = watch::channel(Arc::new(cfg));
         tokio::spawn(async move {
-            let _ = run(rx, None).await;
+            let _ = run(rx, None, Stats::new()).await;
         });
         wait_until_listening(listen_addr).await;
 
@@ -862,7 +926,7 @@ mod tests {
         );
         let (_tx, rx) = watch::channel(Arc::new(cfg));
         tokio::spawn(async move {
-            let _ = run(rx, None).await;
+            let _ = run(rx, None, Stats::new()).await;
         });
         wait_until_listening(listen_addr).await;
 
@@ -900,7 +964,7 @@ mod tests {
         );
         let (_tx, rx) = watch::channel(Arc::new(cfg));
         tokio::spawn(async move {
-            let _ = run(rx, None).await;
+            let _ = run(rx, None, Stats::new()).await;
         });
         wait_until_listening(listen_addr).await;
 
@@ -959,7 +1023,7 @@ mod tests {
         };
         let (_tx, rx) = watch::channel(Arc::new(cfg));
         tokio::spawn(async move {
-            let _ = run(rx, silo).await;
+            let _ = run(rx, silo, Stats::new()).await;
         });
         wait_until_listening(listen_addr).await;
 
@@ -996,7 +1060,7 @@ mod tests {
         };
         let (_tx, rx) = watch::channel(Arc::new(cfg));
         tokio::spawn(async move {
-            let _ = run(rx, silo).await;
+            let _ = run(rx, silo, Stats::new()).await;
         });
         wait_until_listening(listen_addr).await;
 
@@ -1056,7 +1120,7 @@ mod tests {
             active_route: None,
         };
         let (_tx, cfg_rx) = watch::channel(Arc::new(cfg));
-        let ports = SiloPorts::new(cfg_rx, cache.clone());
+        let ports = SiloPorts::new(cfg_rx, cache.clone(), Stats::new());
         let port = ports.ensure(&id).await.unwrap();
 
         // A NO-AUTH client on the dedicated port routes via the variation.
@@ -1077,7 +1141,7 @@ mod tests {
         let (tx, rx) = watch::channel(Arc::new(cfg1));
 
         tokio::spawn(async move {
-            let _ = run(rx, None).await;
+            let _ = run(rx, None, Stats::new()).await;
         });
         wait_until_listening(addr1).await;
 

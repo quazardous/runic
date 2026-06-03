@@ -35,6 +35,9 @@ In:
 - Upstream pool with static YAML config; env-injected or inline creds.
 - Multi-provider routing via the SOCKS5 username (v0.7).
 - Admin API for runtime / permanent config changes (v0.6).
+- Live status surface on the admin port: a self-contained HTML page +
+  `GET /v1/status` JSON — active route, leak (`direct`) warning, session/request
+  counters, and per-silo-variation counts (no client key needed to view).
 - YAML config with file-watch hot reload (debounced ~100 ms).
 - Empty / `default`-less pool tolerated: runic can boot bare and be configured
   live via the admin API (unmatched sessions are declined cleanly).

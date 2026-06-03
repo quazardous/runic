@@ -11,6 +11,17 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+### Added
+
+- **A live status page.** The admin API now serves a small self-contained web
+  page (open the admin port in a browser) showing what runic is doing right now:
+  the active route and whether any traffic is leaving un-proxied, the live and
+  cumulative session counts, the runtime upstream pool, and — in silo mode — each
+  client config with its current connections and request count. The same data is
+  available as JSON at `GET /v1/status`. It is built from public metadata and
+  in-memory counters only: no client key is ever needed, and nothing encrypted is
+  read to render it.
+
 ### Fixed
 
 - **`runic.exe` now works out of the box on Windows.** The CLI's default config

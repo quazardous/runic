@@ -118,6 +118,15 @@ pub struct VariationData {
     pub upstreams: BTreeMap<String, Upstream>,
 }
 
+/// Public, token-free metadata about one variation on disk — what the status
+/// surface can show without decrypting anything.
+#[derive(Debug, Clone)]
+pub struct VariationMeta {
+    pub id: String,
+    pub created_at: u64,
+    pub last_access: u64,
+}
+
 /// One row of the **cleartext** index. Holds no token and no config plaintext —
 /// only the hash (one-way), public timestamps, and the public AEAD nonce — so the
 /// TTL GC can run without any token.
@@ -264,6 +273,26 @@ impl SiloStore {
             self.persist_index()?;
         }
         Ok(expired.len())
+    }
+
+    /// The disk decay TTL (seconds) — for the status surface to compute
+    /// each variation's remaining lifetime.
+    pub fn ttl_secs(&self) -> u64 {
+        self.ttl_secs
+    }
+
+    /// Cleartext metadata for every variation on disk (no token, no decrypt) —
+    /// id + public timestamps. Used by the status surface to list silos.
+    pub fn variations_meta(&self) -> Vec<VariationMeta> {
+        self.index
+            .variations
+            .iter()
+            .map(|(id, e)| VariationMeta {
+                id: id.clone(),
+                created_at: e.created_at,
+                last_access: e.last_access,
+            })
+            .collect()
     }
 
     /// Stamp a known variation's last-access (no token needed — cleartext index).
@@ -413,6 +442,18 @@ impl VariationCache {
         let e = self.warm.get_mut(id)?;
         e.last_touch = now;
         Some(e.data.clone())
+    }
+
+    /// Is this variation currently warm (decrypted in RAM)?
+    pub fn is_warm(&self, id: &str) -> bool {
+        self.warm.contains_key(id)
+    }
+
+    /// The decrypted config of a warm variation, **without touching last-access**
+    /// — for read-only inspection (the status surface) that must not extend a
+    /// variation's lifetime just by being viewed. `None` if not warm.
+    pub fn warm_data(&self, id: &str) -> Option<VariationData> {
+        self.warm.get(id).map(|e| e.data.clone())
     }
 
     /// The variation id for a token (its `SHA256`), for callers that need to key a

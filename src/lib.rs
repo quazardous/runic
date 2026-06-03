@@ -16,6 +16,7 @@ pub mod paths;
 pub mod routing;
 pub mod server;
 pub mod silo;
+pub mod stats;
 pub mod store;
 pub mod upstream;
 pub mod watcher;
