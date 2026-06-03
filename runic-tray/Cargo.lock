@@ -1929,6 +1929,7 @@ dependencies = [
  "anyhow",
  "embed-resource",
  "runic",
+ "serde_json",
  "tao",
  "tokio",
  "tracing",
