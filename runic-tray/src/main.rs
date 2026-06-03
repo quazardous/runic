@@ -14,6 +14,8 @@
 // No console window in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autostart;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -21,7 +23,7 @@ use anyhow::Result;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 
 use runic::{admin, config, server, stats, store, watcher};
@@ -247,6 +249,8 @@ fn main() -> Result<()> {
     let ip_i = MenuItem::new("Show current IP", true, None);
     let config_i = MenuItem::new("Open config file", true, None);
     let logs_i = MenuItem::new("Show logs", true, None);
+    // Opt-in launch-at-login; the checkmark mirrors the actual Run-key state.
+    let autostart_i = CheckMenuItem::new("Start at login", true, autostart::is_enabled(), None);
     let quit_i = MenuItem::new("Quit", true, None);
     menu.append_items(&[
         &start_i,
@@ -257,6 +261,8 @@ fn main() -> Result<()> {
         &ip_i,
         &config_i,
         &logs_i,
+        &PredefinedMenuItem::separator(),
+        &autostart_i,
         &PredefinedMenuItem::separator(),
         &quit_i,
     ])?;
@@ -331,6 +337,16 @@ fn main() -> Result<()> {
                 }
                 id if id == logs_i.id() => {
                     // TODO: open the log file / a simple log window.
+                }
+                id if id == autostart_i.id() => {
+                    // Target the opposite of what's actually persisted, write it,
+                    // then force the checkmark to mirror reality so a failed write
+                    // never leaves the UI lying.
+                    let target = !autostart::is_enabled();
+                    if let Err(e) = autostart::set(target) {
+                        tracing::error!(error = %e, "autostart toggle failed");
+                    }
+                    autostart_i.set_checked(autostart::is_enabled());
                 }
                 id if id == quit_i.id() => {
                     supervisor.stop();
