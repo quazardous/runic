@@ -9,11 +9,12 @@ RUN apk add --no-cache musl-dev
 COPY Cargo.toml ./
 RUN mkdir src \
  && echo 'fn main() { println!("stub"); }' > src/main.rs \
+ && echo '' > src/lib.rs \
  && cargo build --release \
  && rm -rf src target/release/runic target/release/deps/runic*
 
 COPY src ./src
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs src/lib.rs && cargo build --release
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /build/target/release/runic /usr/local/bin/runic
