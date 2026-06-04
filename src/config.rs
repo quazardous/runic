@@ -95,8 +95,9 @@ fn default_silo_ttl_days() -> u64 {
 
 /// Transport kind for an upstream. `HttpConnect` relays through a gateway (the
 /// production path). `Direct` makes a plain TCP connect straight to the target
-/// — NOT proxied, local IP exposed — gated behind `RUNIC_ALLOW_DIRECT=1`, for
-/// dev/CI use only.
+/// — NOT proxied, local IP exposed. Allowed by default (a `direct` upstream must
+/// always be declared explicitly — it is never implicit); set
+/// `RUNIC_ALLOW_DIRECT=0` to forbid it outright (prod hardening).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum UpstreamKind {
@@ -186,8 +187,8 @@ impl UpstreamSpec {
     /// Validate the kind and resolve credentials into a runtime `Upstream`.
     /// `name` is used only for error context. This is the single chokepoint
     /// both the cold YAML loader and the admin hot-add path go through, so the
-    /// `direct` opt-in guard below covers every way a `direct` upstream can be
-    /// introduced.
+    /// `direct` opt-out guard below (`RUNIC_ALLOW_DIRECT=0`) covers every way a
+    /// `direct` upstream can be introduced.
     pub fn resolve(self, name: &str) -> Result<Upstream> {
         match self.kind.as_str() {
             "http_connect" => {
@@ -209,12 +210,14 @@ impl UpstreamSpec {
             }
             "direct" => {
                 // Direct mode is NOT proxied: a plain TCP connect to the target,
-                // with the local IP exposed. Fail-closed behind an explicit env
-                // opt-in so it can never reach prod by a config copy-paste.
-                if std::env::var("RUNIC_ALLOW_DIRECT").ok().as_deref() != Some("1") {
+                // with the local IP exposed. It is allowed by default — the guard
+                // against accidental direct is that an upstream is never implicit:
+                // you must explicitly declare a `kind: direct` entry to use it.
+                // For prod hardening, `RUNIC_ALLOW_DIRECT=0` forbids it outright.
+                if std::env::var("RUNIC_ALLOW_DIRECT").ok().as_deref() == Some("0") {
                     return Err(anyhow!(
-                        "upstreams.{name} kind=direct requires RUNIC_ALLOW_DIRECT=1 — \
-                         direct mode is NOT proxied (local IP exposed), dev/CI only"
+                        "upstreams.{name} kind=direct is forbidden by RUNIC_ALLOW_DIRECT=0 — \
+                         direct mode is NOT proxied (local IP exposed)"
                     ));
                 }
                 // host/port/auth are meaningless for direct; ignore if present.
@@ -417,7 +420,7 @@ upstreams:
     }
 
     #[test]
-    fn direct_kind_gated_by_allow_env() {
+    fn direct_kind_allowed_by_default_forbidden_by_env_0() {
         // One test (not two) so the process-global `RUNIC_ALLOW_DIRECT` mutation
         // is sequential — no parallel-test race. No other test touches this var.
         let yaml = r#"listen:
@@ -426,19 +429,21 @@ upstreams:
   default:
     kind: direct
 "#;
-        // Without the opt-in → fail-closed.
-        std::env::remove_var("RUNIC_ALLOW_DIRECT");
         let f = write_tmp(yaml);
-        let err = Config::load(f.path()).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("RUNIC_ALLOW_DIRECT"), "got: {msg}");
-        assert!(msg.contains("direct"), "got: {msg}");
 
-        // With the opt-in → resolves as a Direct upstream.
-        std::env::set_var("RUNIC_ALLOW_DIRECT", "1");
-        let cfg = Config::load(f.path()).unwrap();
+        // Default (env unset) → direct is allowed: an explicit `kind: direct`
+        // entry is the intentional act; nothing implicit.
         std::env::remove_var("RUNIC_ALLOW_DIRECT");
+        let cfg = Config::load(f.path()).unwrap();
         assert_eq!(cfg.default_upstream().unwrap().kind, UpstreamKind::Direct);
+
+        // Explicit opt-out `=0` → forbidden (prod hardening).
+        std::env::set_var("RUNIC_ALLOW_DIRECT", "0");
+        let err = Config::load(f.path()).unwrap_err();
+        std::env::remove_var("RUNIC_ALLOW_DIRECT");
+        let msg = err.to_string();
+        assert!(msg.contains("RUNIC_ALLOW_DIRECT=0"), "got: {msg}");
+        assert!(msg.contains("direct"), "got: {msg}");
     }
 
     #[test]

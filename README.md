@@ -42,7 +42,8 @@ In:
 - Empty / `default`-less pool tolerated: runic can boot bare and be configured
   live via the admin API (unmatched sessions are declined cleanly).
 - `direct` upstream kind for credential-free local/CI runs — **not proxied**
-  (local IP exposed), opt-in only via `RUNIC_ALLOW_DIRECT=1`.
+  (local IP exposed). Allowed by default but never implicit (must be an explicit
+  `kind: direct` upstream); set `RUNIC_ALLOW_DIRECT=0` to forbid it for hardening.
 - Switch the active default route by name, live, via the admin API
   (`PUT /v1/route/default`) — clients keep the same local port.
 - **Encrypted, per-client config** (opt-in *silo* mode): each client holds its

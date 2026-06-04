@@ -23,8 +23,9 @@ pub async fn connect(
 }
 
 /// Plain TCP connect straight to the requested target — no gateway, no creds.
-/// The local IP is exposed; only reachable when a `direct` upstream was allowed
-/// via `RUNIC_ALLOW_DIRECT=1` (enforced at config-resolve time).
+/// The local IP is exposed; reachable only via an explicitly declared `direct`
+/// upstream (never implicit), unless forbidden by `RUNIC_ALLOW_DIRECT=0`
+/// (enforced at config-resolve time).
 pub async fn connect_direct(target_host: &str, target_port: u16) -> Result<TcpStream> {
     let endpoint = format!("{target_host}:{target_port}");
     TcpStream::connect(&endpoint)

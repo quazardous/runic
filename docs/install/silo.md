@@ -114,6 +114,16 @@ In silo mode a config **is** its encrypted on-disk blob, so a push is
 config already populated, so you can **skip re-pushing** (check `GET /v1/config`
 with your `Bearer` token first).
 
+> **At least one upstream is mandatory.** Opening a silo does **not** by itself
+> route traffic — a silo with no usable upstream is not a "direct passthrough",
+> its sessions are **refused** at CONNECT time (there is no implicit direct). An
+> empty silo is simply a dead end. Push at least one upstream before routing. To
+> egress **direct** (unproxied, local IP exposed) push an explicit
+> `kind: "direct"` upstream and route to it — allowed by default but never
+> implicit (`RUNIC_ALLOW_DIRECT=0` forbids it for hardening). See
+> [the admin-API routing rule](admin-api.md#routing--the-upstream-is-mandatory-rule)
+> and [`kind: "direct"`](admin-api.md#kind-direct).
+
 ## Binding modes
 
 How a *data* connection (the SOCKS5 traffic, not the admin API) is matched to a

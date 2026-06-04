@@ -33,6 +33,27 @@ humans, not machines"), and the project follows
   snapshot). The resolver is shared with the Windows tray so the two never
   diverge.
 
+### Changed
+
+- **Direct egress is now allowed by default — but never implicit.** Declaring a
+  `kind: "direct"` upstream no longer requires the `RUNIC_ALLOW_DIRECT=1`
+  opt-in. The guard against accidentally leaving the proxy is the rule that an
+  upstream is always explicit: traffic only goes out direct if you deliberately
+  declared a `direct` upstream *and* routed to it — an empty pool or empty silo
+  is a dead end (CONNECT refused), never a silent passthrough. For prod
+  hardening, `RUNIC_ALLOW_DIRECT=0` forbids direct outright. (Previously direct
+  was fail-closed and required `=1`.)
+
+### Documentation
+
+- **Spelled out the "an upstream is mandatory" rule.** The admin-API and silo
+  docs now state plainly that runic never egresses direct by default: a session
+  that resolves to no upstream is refused, not silently sent out un-proxied (an
+  empty pool is a valid *boot* state for an API-driven runic, but not a
+  passthrough). The `kind: "direct"` contract — allowed by default, always
+  explicit, `RUNIC_ALLOW_DIRECT=0` to forbid — and its canonical request body
+  (`kind` alone) are now documented.
+
 ## [0.2.0] - 2026-06-02
 
 Pre-1.0; the first tagged cut. So far runic can:

@@ -48,8 +48,9 @@ upstreams:
 
   # `direct` upstream — NOT proxied: runic TCP-connects straight to the target
   # with the local IP exposed. For dev/CI only (exercise the SOCKS5 path without
-  # provider credentials). Fail-closed: requires the env var RUNIC_ALLOW_DIRECT=1,
-  # otherwise runic refuses to start. host/port/auth are not needed for `direct`.
+  # provider credentials). Allowed by default but never implicit — you must
+  # declare this explicit `kind: direct` entry; set RUNIC_ALLOW_DIRECT=0 to
+  # forbid direct outright (prod hardening). host/port/auth are not needed here.
   #
   # direct:
   #   kind: direct

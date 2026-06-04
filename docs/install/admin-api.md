@@ -26,6 +26,26 @@ This is the same split HAProxy draws between its runtime socket and the saved
 config / server state-file — runtime changes are volatile, persistence is an
 explicit, separate act.
 
+## Routing & the "upstream is mandatory" rule
+
+An **upstream is mandatory to carry traffic** — runic never goes out direct by
+default. A session resolves to an upstream (by `provider=`, the active-route
+pointer, or the `default` entry; in silo mode by the variation's token/port).
+**If none resolves, the CONNECT is refused** (`REPLY_GENERAL_FAILURE`) — there
+is **no implicit direct passthrough**.
+
+Two consequences worth stating plainly:
+
+- **Booting with an empty pool is fine** — an API-driven runic can start with no
+  upstreams and have routes pushed later. That is a *boot* state, not an error.
+  The "error" is per-session and at CONNECT time: a session that finds no route
+  is refused, not silently sent out direct.
+- **Direct egress is never implicit.** To make a session go out direct you must
+  push an explicit `kind: "direct"` upstream and route to it — see
+  [`kind: "direct"`](#kind-direct). It is allowed by default but always explicit;
+  `RUNIC_ALLOW_DIRECT=0` forbids it for hardening. An empty silo therefore does
+  **not** mean "passthrough"; it means "no route → refused".
+
 ## Listener
 
 The admin API binds to `admin.addr` from the cold YAML (default
@@ -126,8 +146,50 @@ admin-API form — lets you rotate without a restart) or **env-var** indirection
   "auth": { "username": "user", "password": "secret" } }
 ```
 
+`kind` defaults to `http_connect`. For `http_connect`, `host`, `port` and
+`auth` are **required**. There is no implicit fallback: a session that resolves
+to no upstream is **refused** (CONNECT fails) rather than going out direct —
+see [Routing & the "upstream is mandatory" rule](#routing--the-upstream-is-mandatory-rule).
+
 > The snapshot stores credentials in clear (the file is written `0600`). Treat
 > `runic.snapshot.json` as a secret-bearing file.
+
+#### `kind: "direct"`
+
+A `direct` upstream makes a plain TCP connect straight to the target — **not
+proxied, the local IP is exposed**. It exists so a `runic` route can be
+exercised without a real gateway (dev/CI, or a silo smoke-test).
+
+**Direct is allowed by default — but it is never implicit.** The guard against
+accidental direct egress is not an env flag; it's that **an upstream is always
+explicit**: a session only goes out direct if you deliberately declared a
+`kind: "direct"` upstream *and* routed to it. An empty pool or empty silo is a
+dead end (CONNECT refused), never a silent passthrough — see
+[Routing & the "upstream is mandatory" rule](#routing--the-upstream-is-mandatory-rule).
+
+For **prod hardening**, set `RUNIC_ALLOW_DIRECT=0` on the process to forbid
+direct outright — pushing or loading a `kind: "direct"` upstream then fails:
+
+```
+upstreams.<name> kind=direct is forbidden by RUNIC_ALLOW_DIRECT=0 —
+direct mode is NOT proxied (local IP exposed)
+```
+
+`RUNIC_ALLOW_DIRECT=0` is the only knob (an out-of-band opt-out, set where the
+process is launched — systemd `Environment=`, Docker `-e`, or an `export`); any
+other value, or unset, leaves direct allowed.
+
+The canonical body is **`kind` alone** — `host`, `port` and `auth` are
+meaningless for direct and are **ignored if present** (the stored entry zeroes
+them):
+
+```json
+{ "kind": "direct" }
+```
+
+`kind: "direct"` is a **stable contract**. Any active session routing through a
+direct upstream flips `any_active_direct` to `true` in `GET /v1/status` (the
+"is any traffic leaking right now?" signal).
 
 ## Examples
 
