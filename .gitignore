@@ -3,6 +3,8 @@
 /runic-tray/target
 # Packaged release artifacts (built by packaging/windows/package.ps1).
 /dist
+# Local build tools fetched on the box (e.g. WiX v3 binaries for the MSI) — not vendored.
+/.tools
 Cargo.lock.bak
 *.swp
 .DS_Store

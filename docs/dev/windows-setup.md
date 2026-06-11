@@ -98,8 +98,23 @@ menu toggle so the user opts in.
   ```powershell
   .\packaging\windows\package.ps1
   ```
-- **MSI** via [`cargo-wix`](https://github.com/volks73/cargo-wix) is tracked
-  separately (needs the WiX Toolset installed).
+- **MSI installer** (the "installed" channel) — `packaging\windows\msi.ps1`
+  builds `dist\runic-tray-<version>-windows-x64.msi` via
+  [`cargo-wix`](https://github.com/volks73/cargo-wix) + WiX v3. It installs to
+  Program Files, adds a **"runic" Start-menu shortcut** with the rune icon, and
+  carries a **frozen `UpgradeCode`** so new versions upgrade in place (it does
+  *not* enable auto-start — that stays the opt-in tray toggle, §4):
+  ```powershell
+  cargo install cargo-wix    # once
+  .\packaging\windows\msi.ps1
+  ```
+  Needs WiX v3 (`candle`/`light`). GitHub's `windows-latest` runner ships it
+  with `%WIX%` set; locally, either install the **WiX Toolset v3.14**, or
+  extract the [WiX v3.14 binaries
+  zip](https://github.com/wixtoolset/wix3/releases/tag/wix3141rtm) into
+  `.tools\wix314\bin\` (git-ignored) — `msi.ps1` auto-detects that fallback. The
+  installer source is `runic-tray\wix\main.wxs` (the `UpgradeCode` there must
+  never change).
 
 ### Executable icon
 
