@@ -49,7 +49,7 @@ Two consequences worth stating plainly:
 ## Listener
 
 The admin API binds to `admin.addr` from the cold YAML (default
-`127.0.0.1:7778`). It is **loopback, no auth** — the bind address is the trust
+`127.0.0.1:48484`). It is **loopback, no auth** — the bind address is the trust
 boundary, exactly like the SOCKS5 surface. Do not expose it off-host.
 
 ```yaml
@@ -58,7 +58,7 @@ listen:
   auth: none
 
 admin:
-  addr: "127.0.0.1:7778"   # optional; this is the default
+  addr: "127.0.0.1:48484"   # optional; this is the default
 
 upstreams:
   default:
@@ -195,30 +195,30 @@ direct upstream flips `any_active_direct` to `true` in `GET /v1/status` (the
 
 ```bash
 # Add an upstream at runtime (hot only — gone on restart)
-curl -X POST http://127.0.0.1:7778/v1/upstreams/us-residential \
+curl -X POST http://127.0.0.1:48484/v1/upstreams/us-residential \
   -d '{"kind":"http_connect","host":"gw-us.example","port":823,
        "auth":{"username":"u","password":"p"}}'
 
 # Where does each upstream come from?
-curl http://127.0.0.1:7778/v1/diagnose
+curl http://127.0.0.1:48484/v1/diagnose
 # → {"default":"cold","us-residential":"hot"}
 
 # Make the current runtime state permanent
-curl -X POST http://127.0.0.1:7778/v1/snapshot/promote
-curl http://127.0.0.1:7778/v1/diagnose
+curl -X POST http://127.0.0.1:48484/v1/snapshot/promote
+curl http://127.0.0.1:48484/v1/diagnose
 # → {"default":"cold","us-residential":"snapshot"}   ← survives restart now
 
 # See what shadows what
-curl http://127.0.0.1:7778/v1/diff
+curl http://127.0.0.1:48484/v1/diff
 
 # Flip the active provider for new sessions, by name (clients don't notice)
-curl -X PUT http://127.0.0.1:7778/v1/route/default \
+curl -X PUT http://127.0.0.1:48484/v1/route/default \
   -H 'content-type: application/json' -d '{"upstream":"us-residential"}'
 # ... later, fall back to the `default` entry
-curl -X DELETE http://127.0.0.1:7778/v1/route/default
+curl -X DELETE http://127.0.0.1:48484/v1/route/default
 
 # Forget all persisted runtime state
-curl -X DELETE http://127.0.0.1:7778/v1/snapshot
+curl -X DELETE http://127.0.0.1:48484/v1/snapshot
 ```
 
 ## firewalld mapping

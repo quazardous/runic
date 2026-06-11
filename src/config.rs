@@ -55,7 +55,7 @@ pub struct Admin {
 impl Default for Admin {
     fn default() -> Self {
         Self {
-            addr: SocketAddr::from(([127, 0, 0, 1], 7778)),
+            addr: SocketAddr::from(([127, 0, 0, 1], 48484)),
         }
     }
 }

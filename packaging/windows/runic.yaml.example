@@ -9,7 +9,7 @@ listen:
   auth: none               # loopback only — no auth on the SOCKS5 surface
 
 admin:
-  addr: "127.0.0.1:7778"   # loopback admin API (hot config / status page)
+  addr: "127.0.0.1:48484"   # loopback admin API (hot config / status page)
 
 # Named upstream pool. Clients always hit the same loopback endpoint above;
 # runic decides which upstream the traffic exits through. Leave empty to boot

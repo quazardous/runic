@@ -35,6 +35,13 @@ humans, not machines"), and the project follows
 
 ### Changed
 
+- **The admin API now defaults to port `48484` (was `7778`).** The old default
+  sat right next to the SOCKS5 port `7777`, a commonly-used range; `48484` is a
+  quieter, well-known default so a client can find runic's control plane without
+  being told the port. The port is still fully configurable via `admin.addr`;
+  only setups that relied on the default need to update (the project has no
+  published release yet, so nothing in the wild is affected).
+
 - **Direct egress is now allowed by default — but never implicit.** Declaring a
   `kind: "direct"` upstream no longer requires the `RUNIC_ALLOW_DIRECT=1`
   opt-in. The guard against accidentally leaving the proxy is the rule that an

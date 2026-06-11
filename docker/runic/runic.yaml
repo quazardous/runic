@@ -18,13 +18,13 @@ listen:
   auth: none
 
 # Admin API (v0.6, see docs/install/admin-api.md): runtime/permanent config.
-# runic starts it on 127.0.0.1:7778 by default — inside the container that is
+# runic starts it on 127.0.0.1:48484 by default — inside the container that is
 # only reachable locally. To drive it from the host, bind 0.0.0.0 here and add
-# `127.0.0.1:7778:7778` to the compose port mapping (same loopback stance as
+# `127.0.0.1:48484:48484` to the compose port mapping (same loopback stance as
 # the SOCKS5 surface — the admin API has no auth).
 #
 # admin:
-#   addr: "0.0.0.0:7778"
+#   addr: "0.0.0.0:48484"
 
 upstreams:
   default:
