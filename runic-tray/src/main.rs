@@ -449,7 +449,7 @@ fn main() -> Result<()> {
     let config_i = MenuItem::new("Open config file", true, None);
     let logs_i = MenuItem::new("Show logs", true, None);
     // Opt-in launch-at-login; the checkmark mirrors the actual Run-key state.
-    let autostart_i = CheckMenuItem::new("Start at login", true, autostart::is_enabled(), None);
+    let autostart_i = CheckMenuItem::new("Start with Windows", true, autostart::is_enabled(), None);
     let quit_i = MenuItem::new("Quit", true, None);
     menu.append_items(&[
         &start_i,

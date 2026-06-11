@@ -1,4 +1,4 @@
-//! "Start at login" toggle, backed by the HKCU Run key.
+//! "Start with Windows" toggle, backed by the HKCU Run key.
 //!
 //! Writing `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\runic-tray` =
 //! the quoted path to this executable makes Windows launch the tray at login;
