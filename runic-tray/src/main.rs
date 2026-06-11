@@ -216,6 +216,18 @@ impl IconState {
             IconState::Error => [0xd6, 0x3b, 0x3b],   // red
         }
     }
+
+    /// Hover text that spells out what the icon colour means, so the state is
+    /// discoverable without knowing the colour legend.
+    fn tooltip(self) -> &'static str {
+        match self {
+            IconState::Stopped => "runic — arrêté",
+            IconState::Running => "runic — proxifié",
+            IconState::Direct => "runic — DIRECT : IP réelle exposée",
+            IconState::NoRoute => "runic — aucune route (pool vide)",
+            IconState::Error => "runic — erreur de démarrage",
+        }
+    }
 }
 
 /// Render the Raidho rune as a tray icon: just the glyph (no background, no
@@ -523,12 +535,14 @@ fn main() -> Result<()> {
         .with_icon(raidho_icon(initial_state, ICON_PX)?)
         .build()?;
 
-    // Reflect a state change on the tray icon (best-effort; a render/set failure
-    // must not take the loop down).
+    // Reflect a state change on the tray icon + tooltip (best-effort; a render/
+    // set failure must not take the loop down). The tooltip spells out the
+    // colour so hovering tells you the state in words.
     let set_state = move |tray: &tray_icon::TrayIcon, state: IconState| {
         if let Ok(icon) = raidho_icon(state, ICON_PX) {
             let _ = tray.set_icon(Some(icon));
         }
+        let _ = tray.set_tooltip(Some(state.tooltip()));
     };
 
     // Background: poll the admin status API and stash the active-route class in a
