@@ -28,10 +28,10 @@ Prerequisites and the full plan: [`../docs/dev/windows-setup.md`](../docs/dev/wi
   direct / blue no-route / grey stopped); native Windows toasts on startup and
   for Status; Show current IP (through the local SOCKS5); Open config file;
   Show logs (`%APPDATA%\runic\runic-tray.log`); **Start with Windows** toggle
-  (HKCU Run key); embedded `.ico` (Raidho rune); portable ZIP + MSI packaging.
+  (HKCU Run key); embedded `.ico` (Raidho rune); portable ZIP + MSI packaging;
+  **auto-update** — Check for updates + opt-in startup check, SHA256-verified MSI
+  install (GitHub Releases, `tray-v*` tag).
 - **TODO**:
-  - Auto-update (#763): check the release feed, verified download, swap on
-    restart.
   - Lib follow-up: shutdown handles for the watcher/admin listeners so Stop
     fully tears the core down (today Stop only halts the SOCKS5 server).
 

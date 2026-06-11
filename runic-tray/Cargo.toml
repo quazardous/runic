@@ -33,6 +33,10 @@ runic = { path = ".." }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 anyhow = "1"
 serde_json = "1"
+# Auto-update (#763): HTTPS to the GitHub Releases API + verified download,
+# and SHA256 to check the artifact before running it.
+ureq = { version = "2", features = ["json"] }
+sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # File sink for the tray log (stderr is lost under windows_subsystem="windows");
