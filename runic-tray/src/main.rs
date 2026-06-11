@@ -15,7 +15,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod autostart;
+mod prefs;
 mod toast;
+mod update;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -48,7 +50,20 @@ const ROUTE_NOROUTE: u8 = 3; // no active route (empty pool / boot-empty)
 /// string back so the toast is shown on the UI thread, where COM is initialised.
 enum UserEvent {
     Menu(MenuEvent),
-    Toast { title: String, body: String },
+    Toast {
+        title: String,
+        body: String,
+    },
+    /// Result of an update check, marshaled back from a background task.
+    /// `manual` distinguishes a user-triggered check (toast even when up to
+    /// date) from the silent startup check (toast only when an update exists).
+    UpdateChecked {
+        update: Option<update::Update>,
+        manual: bool,
+    },
+    /// Clean shutdown requested from a background task (e.g. after launching the
+    /// installer, the tray must exit to unlock its exe).
+    Quit,
 }
 
 /// A minimal commented config written on first "Open config file" when none
@@ -469,6 +484,30 @@ fn init_logging() -> (
 
 const LOG_FILE: &str = "runic-tray.log";
 
+/// Run an update check on a blocking pool thread (ureq is blocking) and marshal
+/// the result back into the event loop. `manual` true = a user-clicked check
+/// (report even when up to date / on error); false = the silent startup check.
+fn spawn_update_check(
+    handle: &tokio::runtime::Handle,
+    proxy: tao::event_loop::EventLoopProxy<UserEvent>,
+    manual: bool,
+) {
+    handle.spawn_blocking(move || match update::check() {
+        Ok(update) => {
+            let _ = proxy.send_event(UserEvent::UpdateChecked { update, manual });
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "update check failed");
+            if manual {
+                let _ = proxy.send_event(UserEvent::Toast {
+                    title: "runic — updates".to_string(),
+                    body: format!("check failed: {e}"),
+                });
+            }
+        }
+    });
+}
+
 fn main() -> Result<()> {
     let (log_path, _log_guard) = init_logging();
 
@@ -493,6 +532,11 @@ fn main() -> Result<()> {
     let ip_i = MenuItem::new("Show current IP", true, None);
     let config_i = MenuItem::new("Open config file", true, None);
     let logs_i = MenuItem::new("Show logs", true, None);
+    let check_i = MenuItem::new("Check for updates", true, None);
+    // Disabled until a check finds a newer release; then relabeled + enabled.
+    let update_i = MenuItem::new("Install update", false, None);
+    // Opt-in: check for updates at startup (persisted, mirrors the real pref).
+    let autoupdate_i = CheckMenuItem::new("Auto-update", true, prefs::auto_update_enabled(), None);
     // Opt-in launch-at-login; the checkmark mirrors the actual Run-key state.
     let autostart_i = CheckMenuItem::new("Start with Windows", true, autostart::is_enabled(), None);
     let quit_i = MenuItem::new("Quit", true, None);
@@ -506,6 +550,9 @@ fn main() -> Result<()> {
         &config_i,
         &logs_i,
         &PredefinedMenuItem::separator(),
+        &check_i,
+        &update_i,
+        &autoupdate_i,
         &autostart_i,
         &PredefinedMenuItem::separator(),
         &quit_i,
@@ -573,8 +620,16 @@ fn main() -> Result<()> {
         },
     );
 
+    // Opt-in: only check at startup if the user enabled auto-update. Silent
+    // unless a newer release exists.
+    if prefs::auto_update_enabled() {
+        spawn_update_check(supervisor.rt.handle(), toast_proxy.clone(), false);
+    }
+
     // Last start/restart error, surfaced by the Status toast.
     let mut last_error: Option<String> = None;
+    // Newest release found by a check, applied when "Install update" is clicked.
+    let mut pending_update: Option<update::Update> = None;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + POLL_EVERY);
@@ -600,6 +655,31 @@ fn main() -> Result<()> {
             // A background task (Show IP) finished and handed back a toast.
             tao::event::Event::UserEvent(UserEvent::Toast { title, body }) => {
                 toast::toast(&title, &body);
+            }
+            // An update check completed (startup or manual).
+            tao::event::Event::UserEvent(UserEvent::UpdateChecked { update, manual }) => {
+                match update {
+                    Some(u) => {
+                        update_i.set_text(format!("Install update v{}", u.version));
+                        update_i.set_enabled(true);
+                        toast::toast(
+                            "runic — updates",
+                            &format!("update v{} available — use \"Install update\"", u.version),
+                        );
+                        pending_update = Some(u);
+                    }
+                    None if manual => toast::toast(
+                        "runic — updates",
+                        &format!("runic is up to date (v{})", update::current()),
+                    ),
+                    None => {}
+                }
+            }
+            // A background task asked for a clean exit (e.g. after launching the
+            // installer, which must replace this exe).
+            tao::event::Event::UserEvent(UserEvent::Quit) => {
+                supervisor.stop();
+                *control_flow = ControlFlow::Exit;
             }
             tao::event::Event::UserEvent(UserEvent::Menu(menu_event)) => {
                 match menu_event.id {
@@ -679,6 +759,38 @@ fn main() -> Result<()> {
                         }
                         None => toast::toast("runic", "log file unavailable"),
                     },
+                    id if id == check_i.id() => {
+                        toast::toast("runic — updates", "checking…");
+                        spawn_update_check(supervisor.rt.handle(), toast_proxy.clone(), true);
+                    }
+                    id if id == update_i.id() => {
+                        if let Some(u) = pending_update.clone() {
+                            toast::toast(
+                                "runic — updates",
+                                &format!("downloading update v{}…", u.version),
+                            );
+                            let proxy = toast_proxy.clone();
+                            supervisor.rt.handle().spawn_blocking(move || {
+                                match update::apply(&u) {
+                                    Ok(()) => {
+                                        let _ = proxy.send_event(UserEvent::Toast {
+                                            title: "runic — updates".to_string(),
+                                            body: "installer launched — the tray will close"
+                                                .to_string(),
+                                        });
+                                        let _ = proxy.send_event(UserEvent::Quit);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "update apply failed");
+                                        let _ = proxy.send_event(UserEvent::Toast {
+                                            title: "runic — updates".to_string(),
+                                            body: format!("update failed: {e}"),
+                                        });
+                                    }
+                                }
+                            });
+                        }
+                    }
                     id if id == autostart_i.id() => {
                         // Target the opposite of what's actually persisted, write it,
                         // then force the checkmark to mirror reality so a failed write
@@ -688,6 +800,21 @@ fn main() -> Result<()> {
                             tracing::error!(error = %e, "autostart toggle failed");
                         }
                         autostart_i.set_checked(autostart::is_enabled());
+                    }
+                    id if id == autoupdate_i.id() => {
+                        // Same opt-in toggle pattern as autostart: flip the persisted
+                        // pref, re-sync the checkmark to reality, and run a check
+                        // immediately when turning it on so it gives feedback.
+                        let target = !prefs::auto_update_enabled();
+                        if let Err(e) = prefs::set_auto_update(target) {
+                            tracing::error!(error = %e, "auto-update toggle failed");
+                        }
+                        let on = prefs::auto_update_enabled();
+                        autoupdate_i.set_checked(on);
+                        if on {
+                            toast::toast("runic — updates", "checking…");
+                            spawn_update_check(supervisor.rt.handle(), toast_proxy.clone(), true);
+                        }
                     }
                     id if id == quit_i.id() => {
                         supervisor.stop();
