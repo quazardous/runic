@@ -1,0 +1,42 @@
+# Publish a runic-tray Windows release when a `tray-v*` tag is pushed.
+#
+# Tag scheme: tray releases are `tray-vX.Y.Z` (the core/lib/CLI uses a bare
+# `vX.Y.Z`), so this workflow only fires for the tray and never collides with
+# core tags. The auto-updater filters GitHub releases on the `tray-` prefix.
+#
+# Runs on windows-latest, which uses the MSVC toolchain by default — the exe
+# icon embeds via rc.exe, so no mingw/PATH tweak is needed (unlike a local GNU
+# build). package.ps1 skips its mingw step when that path is absent.
+name: release-tray
+
+on:
+  push:
+    tags:
+      - "tray-v*"
+
+permissions:
+  contents: write # needed to create the GitHub Release
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build + package portable ZIP
+        shell: pwsh
+        run: .\packaging\windows\package.ps1
+
+      - name: Checksum + publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = Get-ChildItem dist\runic-tray-*-windows-x64.zip | Select-Object -First 1
+          $sha = "$($zip.FullName).sha256"
+          $hash = (Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($zip.Name)" | Set-Content -Path $sha -Encoding ascii
+          gh release create "${{ github.ref_name }}" `
+            "$($zip.FullName)" "$sha" `
+            --title "runic-tray ${{ github.ref_name }}" `
+            --generate-notes
