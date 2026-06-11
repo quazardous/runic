@@ -38,3 +38,51 @@ tempfile = "3"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# --- Linux packaging -------------------------------------------------------
+# Built in release-core.yml from the static musl binary (zero runtime deps).
+#   .deb:  cargo deb  --no-build --target x86_64-unknown-linux-musl
+#   .rpm:  cargo generate-rpm    --target x86_64-unknown-linux-musl
+
+[package.metadata.deb]
+maintainer = "David Berlioz <berliozdavid@gmail.com>"
+copyright = "2026, runic authors"
+license-file = ["LICENSE-MIT", "0"]
+extended-description = """
+Local SOCKS5 proxy that relays via HTTP CONNECT to a single authenticated \
+upstream gateway. The client speaks plain no-auth SOCKS5 on loopback; runic \
+holds the upstream credentials and re-originates each connection through the \
+gateway."""
+section = "net"
+priority = "optional"
+# `target/release` is cargo-deb's special prefix — it rewrites it to the real
+# (cross-)target dir when invoked with `--target x86_64-unknown-linux-musl`.
+# Explicit maintainer-scripts (packaging/linux/deb) handle the systemd lifecycle,
+# mirroring the rpm scriptlets: daemon-reload on install, disable --now on remove.
+assets = [
+    ["target/release/runic", "usr/bin/", "755"],
+    ["packaging/linux/runic.yaml", "etc/runic/runic.yaml", "644"],
+    ["packaging/linux/runic.service", "usr/lib/systemd/system/runic.service", "644"],
+    ["README.md", "usr/share/doc/runic/README.md", "644"],
+    ["CHANGELOG.md", "usr/share/doc/runic/CHANGELOG.md", "644"],
+]
+conf-files = ["/etc/runic/runic.yaml"]
+maintainer-scripts = "packaging/linux/deb"
+
+[package.metadata.generate-rpm]
+summary = "Local SOCKS5 proxy relaying via HTTP CONNECT upstream"
+# Static musl binary — no shared-library auto-requires.
+auto-req = "no"
+assets = [
+    { source = "target/x86_64-unknown-linux-musl/release/runic", dest = "/usr/bin/runic", mode = "755" },
+    { source = "packaging/linux/runic.yaml", dest = "/etc/runic/runic.yaml", mode = "644", config = "noreplace" },
+    { source = "packaging/linux/runic.service", dest = "/usr/lib/systemd/system/runic.service", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/runic/README.md", mode = "644", doc = true },
+    { source = "CHANGELOG.md", dest = "/usr/share/doc/runic/CHANGELOG.md", mode = "644", doc = true },
+]
+# cargo-generate-rpm is not rpmbuild, so no %systemd_* macros — use plain
+# scriptlets. Install: just refresh systemd (no force-enable, mirrors the .deb).
+post_install_script = "systemctl daemon-reload >/dev/null 2>&1 || :"
+# Uninstall only (arg 0), not upgrade: stop+disable before files vanish.
+pre_uninstall_script = "if [ \"$1\" = 0 ]; then systemctl --no-reload disable --now runic.service >/dev/null 2>&1 || :; fi"
+post_uninstall_script = "systemctl daemon-reload >/dev/null 2>&1 || :"

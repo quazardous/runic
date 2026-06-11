@@ -1,0 +1,8 @@
+#!/bin/sh
+# Refresh systemd so it sees the freshly-installed unit (mirrors the rpm
+# post-install). The unit is NOT auto-enabled — run `systemctl enable --now
+# runic` to start it.
+set -e
+if [ "$1" = "configure" ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || :
+fi

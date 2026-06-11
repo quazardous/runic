@@ -1,0 +1,43 @@
+[Unit]
+Description=runic — local SOCKS5 proxy relaying via HTTP CONNECT upstream
+Documentation=https://github.com/quazardous/runic
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/runic --config /etc/runic/runic.yaml
+
+# Optional secrets (e.g. upstream credentials referenced by *_env in the YAML).
+# systemd reads this as root before dropping privileges, so it may be 0600 root.
+EnvironmentFile=-/etc/runic/runic.env
+
+# Run unprivileged under a transient, isolated user — no useradd/maintainer
+# scripts needed, and nothing to clean up on removal.
+DynamicUser=yes
+
+# Persisted state: the snapshot may hold cleartext upstream credentials. runic
+# resolves its snapshot under $XDG_CONFIG_HOME/runic; pointing XDG_CONFIG_HOME at
+# the StateDirectory lands it in /var/lib/runic (owner-only), with no core change.
+StateDirectory=runic
+StateDirectoryMode=0700
+Environment=XDG_CONFIG_HOME=/var/lib
+
+# Hardening — runic only needs outbound TCP and its loopback listeners.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
