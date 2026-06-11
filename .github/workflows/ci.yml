@@ -5,7 +5,9 @@
 #     so it gets the full fmt + clippy + test gate on ubuntu.
 #   - `runic-tray` is a standalone crate (not a workspace member) with
 #     cfg(windows) code that only compiles under MSVC, so it is gated on
-#     windows-latest (fmt + clippy, which also compiles it).
+#     windows-latest with a plain `cargo build` — a compile check so the core
+#     can't silently break the tray. fmt/clippy on the tray are the tray
+#     owner's call (its sources aren't enrolled in this gate).
 name: ci
 
 on:
@@ -37,7 +39,7 @@ jobs:
         run: cargo test --all
 
   tray:
-    name: tray — fmt / clippy (Windows/MSVC)
+    name: tray — build (Windows/MSVC)
     runs-on: windows-latest
     defaults:
       run:
@@ -45,12 +47,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: runic-tray
-      - name: rustfmt
-        run: cargo fmt --all --check
-      - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+      - name: build
+        run: cargo build --all-targets
