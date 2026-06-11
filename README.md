@@ -120,6 +120,12 @@ runic [--config /etc/runic/runic.yaml] [--log <env_filter>]
 - **Admin API is loopback + unauthenticated** by default (`127.0.0.1:48484`):
   the bind address is the trust boundary. `runic.snapshot.json` stores upstream
   credentials in clear (written `0600`) — treat it as a secret-bearing file.
+- **Status page.** Point a browser at the admin port — `http://127.0.0.1:48484/`
+  — for a live, self-refreshing status page (active route, session counts,
+  upstream pool); or `curl http://127.0.0.1:48484/v1/status` for the same data
+  as JSON. Both are loopback-only — under Docker, publish the admin port
+  (`127.0.0.1:48484:48484`) to reach it from the host. See
+  [`docs/install/admin-api.md`](docs/install/admin-api.md).
 - **Logs are plain stdout/stderr**, structured via `tracing`. `RUNIC_LOG` is an
   `EnvFilter` string (e.g. `runic=debug` for more detail).
 - **No state.** Restart is free, no warm-up, no persisted session.
