@@ -4,6 +4,22 @@ Local SOCKS5 proxy that relays via HTTP CONNECT upstream, written in Rust.
 Sized as a drop-in replacement of [gost](https://github.com/go-gost/gost) for
 the narrow case "SOCKS5 in, single upstream HTTP CONNECT out, static creds".
 
+## Why
+
+Some upstream proxies — residential or datacenter gateways such as DataImpulse —
+only speak **HTTP CONNECT with Basic auth**, while the client you actually want
+to route (a browser, an HTTP library, an automation tool) often only speaks
+**plain SOCKS5** and can't present those credentials — Chromium, notably, offers
+only no-auth SOCKS5. runic bridges that gap: it exposes a local **no-auth
+SOCKS5** port, holds the upstream credentials itself, and re-originates every
+connection through the authenticated gateway. The client just points at
+`127.0.0.1:7777` and never sees — or needs to know — the upstream or its creds.
+
+That keeps secrets off the client, lets you swap or rotate the upstream without
+touching the client, and (in *silo* mode) gives each client its own encrypted,
+isolated config. runic stays deliberately small: it forwards bytes, it does not
+inspect or rewrite traffic.
+
 ## What it does
 
 ```
@@ -57,7 +73,7 @@ Out (future):
 - Smart fail-rate routing, GB tracking.
 - Auth on the SOCKS5 / admin surfaces (this release = loopback only).
 - UDP ASSOCIATE / BIND.
-- Desktop tray app (Windows + Linux).
+- Linux desktop tray (the Windows tray already ships — see `runic-tray/`).
 
 ## Install
 
