@@ -341,11 +341,22 @@ async fn fetch_public_ip(socks: SocketAddr) -> Result<String> {
     // Reply: VER REP RSV ATYP BND.ADDR BND.PORT — REP 0 = success.
     let mut head = [0u8; 4];
     s.read_exact(&mut head).await?;
-    anyhow::ensure!(
-        head[1] == 0x00,
-        "SOCKS5 connect rejected (code {})",
-        head[1]
-    );
+    if head[1] != 0x00 {
+        // Map the RFC 1928 reply code to something readable (code 1 = the proxy
+        // had no way to route — usually an empty pool, handled before we get here).
+        let reason = match head[1] {
+            1 => "échec général du proxy (aucune route ?)",
+            2 => "connexion interdite par la règle",
+            3 => "réseau injoignable",
+            4 => "hôte injoignable",
+            5 => "connexion refusée",
+            6 => "TTL expiré",
+            7 => "commande non supportée",
+            8 => "type d'adresse non supporté",
+            c => return Err(anyhow::anyhow!("rejet SOCKS5 (code {c})")),
+        };
+        anyhow::bail!("{reason}");
+    }
     let bnd = match head[3] {
         0x01 => 4,
         0x04 => 16,
@@ -376,7 +387,9 @@ async fn fetch_public_ip(socks: SocketAddr) -> Result<String> {
     Ok(ip.to_string())
 }
 
-/// Open a path with its Windows default handler (`cmd /C start "" <path>`).
+/// Open a path with its Windows default handler. Last resort only: `cmd /C
+/// start` briefly flashes a console window, so the text-file openers below
+/// prefer Notepad and fall back here only if it can't be launched.
 fn open_path(path: &Path) -> Result<()> {
     std::process::Command::new("cmd")
         .args(["/C", "start", "", &path.to_string_lossy()])
@@ -384,17 +397,11 @@ fn open_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Open the config file, seeding a commented example if it doesn't exist yet.
-/// Prefer Notepad: the default `.yaml` handler is often a heavy editor (VS Code)
-/// — for a quick config tweak a plain text editor is friendlier. Fall back to
-/// the default handler if Notepad can't be launched.
-fn open_config(path: &Path) -> Result<()> {
-    if !path.exists() {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, CONFIG_EXAMPLE)?;
-    }
+/// Open a (text) file in Notepad. Notepad is a GUI app, so unlike `cmd /C start`
+/// it opens with no flashing console window; and the default `.yaml`/`.log`
+/// handler is often a heavy editor (VS Code). Falls back to the default handler
+/// only if Notepad can't be launched (it ships with every Windows).
+fn open_in_notepad(path: &Path) -> Result<()> {
     if std::process::Command::new("notepad.exe")
         .arg(path)
         .spawn()
@@ -404,6 +411,17 @@ fn open_config(path: &Path) -> Result<()> {
     } else {
         open_path(path)
     }
+}
+
+/// Open the config file, seeding a commented example if it doesn't exist yet.
+fn open_config(path: &Path) -> Result<()> {
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, CONFIG_EXAMPLE)?;
+    }
+    open_in_notepad(path)
 }
 
 /// Initialise tracing to a file so logs survive `windows_subsystem="windows"`
@@ -602,7 +620,17 @@ fn main() -> Result<()> {
                         toast::toast("runic — status", &body);
                     }
                     id if id == ip_i.id() => match supervisor.socks_addr() {
-                        Some(addr) if supervisor.is_running() => {
+                        _ if !supervisor.is_running() => {
+                            toast::toast("runic — IP", "proxy arrêté — démarre-le d'abord")
+                        }
+                        // No active route (empty pool / boot-empty): the proxy
+                        // would reject the CONNECT with a bare "code 1". Say what
+                        // actually needs doing instead.
+                        _ if route.load(Ordering::Relaxed) == ROUTE_NOROUTE => toast::toast(
+                            "runic — IP",
+                            "aucune route active (pool vide) — ajoute un upstream pour router le trafic",
+                        ),
+                        Some(addr) => {
                             // Network I/O on the runtime; the result is marshaled
                             // back as a Toast event so it shows on the UI thread.
                             let proxy = toast_proxy.clone();
@@ -617,7 +645,7 @@ fn main() -> Result<()> {
                                 });
                             });
                         }
-                        _ => toast::toast("runic — IP", "proxy arrêté — démarre-le d'abord"),
+                        None => toast::toast("runic — IP", "proxy pas encore initialisé"),
                     },
                     id if id == config_i.id() => {
                         if let Err(e) = open_config(&config_path) {
@@ -627,7 +655,7 @@ fn main() -> Result<()> {
                     }
                     id if id == logs_i.id() => match &log_path {
                         Some(p) => {
-                            if let Err(e) = open_path(p) {
+                            if let Err(e) = open_in_notepad(p) {
                                 tracing::error!(error = %e, "open logs failed");
                             }
                         }
