@@ -14,8 +14,15 @@
 name = "runic-tray"
 version = "0.1.0"
 edition = "2021"
+authors = ["David Berlioz <berliozdavid@gmail.com>"]
 description = "Windows system-tray front-end for runic"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/quazardous/runic"
+
+# MSI installer (cargo-wix, #764). The dual-license string isn't a single
+# recognised license, so skip the EULA dialog rather than ship a half one.
+[package.metadata.wix]
+eula = false
 
 [[bin]]
 name = "runic-tray"
