@@ -460,6 +460,10 @@ const LOG_FILE: &str = "runic-tray.log";
 fn main() -> Result<()> {
     let (log_path, _log_guard) = init_logging();
 
+    // Register runic's own AppUserModelID so toasts read "runic" (not "Windows
+    // PowerShell") — must run before the first toast.
+    toast::init();
+
     // Shared with the CLI: `%APPDATA%\runic\runic.yaml` on Windows (single
     // source of truth in `runic::paths`, no divergent copy here).
     let mut supervisor = Supervisor::new(runic::paths::default_config_path())?;
