@@ -216,6 +216,18 @@ impl IconState {
             IconState::Error => [0xd6, 0x3b, 0x3b],   // red
         }
     }
+
+    /// Hover text that spells out what the icon colour means, so the state is
+    /// discoverable without knowing the colour legend.
+    fn tooltip(self) -> &'static str {
+        match self {
+            IconState::Stopped => "runic — stopped",
+            IconState::Running => "runic — proxied",
+            IconState::Direct => "runic — DIRECT: real IP exposed",
+            IconState::NoRoute => "runic — no route (empty pool)",
+            IconState::Error => "runic — start error",
+        }
+    }
 }
 
 /// Render the Raidho rune as a tray icon: just the glyph (no background, no
@@ -341,11 +353,22 @@ async fn fetch_public_ip(socks: SocketAddr) -> Result<String> {
     // Reply: VER REP RSV ATYP BND.ADDR BND.PORT — REP 0 = success.
     let mut head = [0u8; 4];
     s.read_exact(&mut head).await?;
-    anyhow::ensure!(
-        head[1] == 0x00,
-        "SOCKS5 connect rejected (code {})",
-        head[1]
-    );
+    if head[1] != 0x00 {
+        // Map the RFC 1928 reply code to something readable (code 1 = the proxy
+        // had no way to route — usually an empty pool, handled before we get here).
+        let reason = match head[1] {
+            1 => "general proxy failure (no route?)",
+            2 => "connection not allowed by ruleset",
+            3 => "network unreachable",
+            4 => "host unreachable",
+            5 => "connection refused",
+            6 => "TTL expired",
+            7 => "command not supported",
+            8 => "address type not supported",
+            c => return Err(anyhow::anyhow!("SOCKS5 rejected (code {c})")),
+        };
+        anyhow::bail!("{reason}");
+    }
     let bnd = match head[3] {
         0x01 => 4,
         0x04 => 16,
@@ -376,12 +399,30 @@ async fn fetch_public_ip(socks: SocketAddr) -> Result<String> {
     Ok(ip.to_string())
 }
 
-/// Open a path with its Windows default handler (`cmd /C start "" <path>`).
+/// Open a path with its Windows default handler. Last resort only: `cmd /C
+/// start` briefly flashes a console window, so the text-file openers below
+/// prefer Notepad and fall back here only if it can't be launched.
 fn open_path(path: &Path) -> Result<()> {
     std::process::Command::new("cmd")
         .args(["/C", "start", "", &path.to_string_lossy()])
         .spawn()?;
     Ok(())
+}
+
+/// Open a (text) file in Notepad. Notepad is a GUI app, so unlike `cmd /C start`
+/// it opens with no flashing console window; and the default `.yaml`/`.log`
+/// handler is often a heavy editor (VS Code). Falls back to the default handler
+/// only if Notepad can't be launched (it ships with every Windows).
+fn open_in_notepad(path: &Path) -> Result<()> {
+    if std::process::Command::new("notepad.exe")
+        .arg(path)
+        .spawn()
+        .is_ok()
+    {
+        Ok(())
+    } else {
+        open_path(path)
+    }
 }
 
 /// Open the config file, seeding a commented example if it doesn't exist yet.
@@ -392,7 +433,7 @@ fn open_config(path: &Path) -> Result<()> {
         }
         std::fs::write(path, CONFIG_EXAMPLE)?;
     }
-    open_path(path)
+    open_in_notepad(path)
 }
 
 /// Initialise tracing to a file so logs survive `windows_subsystem="windows"`
@@ -431,6 +472,10 @@ const LOG_FILE: &str = "runic-tray.log";
 fn main() -> Result<()> {
     let (log_path, _log_guard) = init_logging();
 
+    // Register runic's own AppUserModelID so toasts read "runic" (not "Windows
+    // PowerShell") — must run before the first toast.
+    toast::init();
+
     // Shared with the CLI: `%APPDATA%\runic\runic.yaml` on Windows (single
     // source of truth in `runic::paths`, no divergent copy here).
     let mut supervisor = Supervisor::new(runic::paths::default_config_path())?;
@@ -449,7 +494,7 @@ fn main() -> Result<()> {
     let config_i = MenuItem::new("Open config file", true, None);
     let logs_i = MenuItem::new("Show logs", true, None);
     // Opt-in launch-at-login; the checkmark mirrors the actual Run-key state.
-    let autostart_i = CheckMenuItem::new("Start at login", true, autostart::is_enabled(), None);
+    let autostart_i = CheckMenuItem::new("Start with Windows", true, autostart::is_enabled(), None);
     let quit_i = MenuItem::new("Quit", true, None);
     menu.append_items(&[
         &start_i,
@@ -490,12 +535,14 @@ fn main() -> Result<()> {
         .with_icon(raidho_icon(initial_state, ICON_PX)?)
         .build()?;
 
-    // Reflect a state change on the tray icon (best-effort; a render/set failure
-    // must not take the loop down).
+    // Reflect a state change on the tray icon + tooltip (best-effort; a render/
+    // set failure must not take the loop down). The tooltip spells out the
+    // colour so hovering tells you the state in words.
     let set_state = move |tray: &tray_icon::TrayIcon, state: IconState| {
         if let Ok(icon) = raidho_icon(state, ICON_PX) {
             let _ = tray.set_icon(Some(icon));
         }
+        let _ = tray.set_tooltip(Some(state.tooltip()));
     };
 
     // Background: poll the admin status API and stash the active-route class in a
@@ -515,14 +562,14 @@ fn main() -> Result<()> {
 
     let config_path = runic::paths::default_config_path();
 
-    // The "popup that identifies it" david asked for — the icon otherwise lands
+    // The "popup that identifies it" the icon otherwise lacks — it lands
     // silently (Windows 11 even hides it in the overflow).
     toast::toast(
         "runic ᚱ",
         if matches!(initial_state, IconState::Running) {
-            "démarré"
+            "started"
         } else {
-            "démarré (proxy arrêté)"
+            "started (proxy stopped)"
         },
     );
 
@@ -579,26 +626,36 @@ fn main() -> Result<()> {
                     id if id == status_i.id() => {
                         let body = if supervisor.is_running() {
                             match route.load(Ordering::Relaxed) {
-                                ROUTE_DIRECT => "running — route DIRECTE (IP exposée)".to_string(),
-                                ROUTE_NOROUTE => "running — aucune route (pool vide)".to_string(),
-                                _ => "running — proxifié".to_string(),
+                                ROUTE_DIRECT => "running — DIRECT route (IP exposed)".to_string(),
+                                ROUTE_NOROUTE => "running — no route (empty pool)".to_string(),
+                                _ => "running — proxied".to_string(),
                             }
                         } else if let Some(e) = &last_error {
-                            format!("stopped — dernière erreur : {e}")
+                            format!("stopped — last error: {e}")
                         } else {
                             "stopped".to_string()
                         };
                         toast::toast("runic — status", &body);
                     }
                     id if id == ip_i.id() => match supervisor.socks_addr() {
-                        Some(addr) if supervisor.is_running() => {
+                        _ if !supervisor.is_running() => {
+                            toast::toast("runic — IP", "proxy stopped — start it first")
+                        }
+                        // No active route (empty pool / boot-empty): the proxy
+                        // would reject the CONNECT with a bare "code 1". Say what
+                        // actually needs doing instead.
+                        _ if route.load(Ordering::Relaxed) == ROUTE_NOROUTE => toast::toast(
+                            "runic — IP",
+                            "no active route (empty pool) — add an upstream to route traffic",
+                        ),
+                        Some(addr) => {
                             // Network I/O on the runtime; the result is marshaled
                             // back as a Toast event so it shows on the UI thread.
                             let proxy = toast_proxy.clone();
                             supervisor.rt.handle().spawn(async move {
                                 let (title, body) = match fetch_public_ip(addr).await {
-                                    Ok(ip) => ("runic — IP publique", ip),
-                                    Err(e) => ("runic — IP", format!("échec : {e}")),
+                                    Ok(ip) => ("runic — public IP", ip),
+                                    Err(e) => ("runic — IP", format!("failed: {e}")),
                                 };
                                 let _ = proxy.send_event(UserEvent::Toast {
                                     title: title.to_string(),
@@ -606,21 +663,21 @@ fn main() -> Result<()> {
                                 });
                             });
                         }
-                        _ => toast::toast("runic — IP", "proxy arrêté — démarre-le d'abord"),
+                        None => toast::toast("runic — IP", "proxy not initialised yet"),
                     },
                     id if id == config_i.id() => {
                         if let Err(e) = open_config(&config_path) {
                             tracing::error!(error = %e, "open config failed");
-                            toast::toast("runic", &format!("ouverture config échouée : {e}"));
+                            toast::toast("runic", &format!("could not open config: {e}"));
                         }
                     }
                     id if id == logs_i.id() => match &log_path {
                         Some(p) => {
-                            if let Err(e) = open_path(p) {
+                            if let Err(e) = open_in_notepad(p) {
                                 tracing::error!(error = %e, "open logs failed");
                             }
                         }
-                        None => toast::toast("runic", "journal indisponible"),
+                        None => toast::toast("runic", "log file unavailable"),
                     },
                     id if id == autostart_i.id() => {
                         // Target the opposite of what's actually persisted, write it,

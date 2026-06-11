@@ -48,9 +48,10 @@ tray-icon = "0.19"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_Registry",
-    # Native toast notifications (WinRT), see src/toast.rs.
+    # Native toast notifications (WinRT) + own AppUserModelID, see src/toast.rs.
     "UI_Notifications",
     "Data_Xml_Dom",
+    "Win32_UI_Shell",
 ] }
 
 [build-dependencies]

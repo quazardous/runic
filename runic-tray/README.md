@@ -22,15 +22,16 @@ Prerequisites and the full plan: [`../docs/dev/windows-setup.md`](../docs/dev/wi
 
 ## What works vs TODO
 
-- **Wired**: tray menu, tokio runtime + Supervisor that boots the `runic` core
-  (config store, watcher, admin API, SOCKS5 server), Start / Stop / Restart,
-  Status (logged), Quit, auto-start of the proxy on launch.
-- **TODO** (marked in `src/main.rs`):
-  - Show-current-IP via an internal request through the local SOCKS5 + a toast.
-  - Open config / Show logs actions.
-  - Native Windows toasts for status/IP.
-  - Auto-start at login (registry `Run` key / Startup shortcut).
-  - A proper `.ico` asset (a placeholder icon is generated for now).
+- **Wired**: tray menu over a tokio runtime + Supervisor that boots the `runic`
+  core (config store, watcher, admin API, SOCKS5 server); Start / Stop / Restart,
+  Quit; the Raidho icon recolours live by active route (teal proxied / amber
+  direct / blue no-route / grey stopped); native Windows toasts on startup and
+  for Status; Show current IP (through the local SOCKS5); Open config file;
+  Show logs (`%APPDATA%\runic\runic-tray.log`); **Start with Windows** toggle
+  (HKCU Run key); embedded `.ico` (Raidho rune); portable ZIP + MSI packaging.
+- **TODO**:
+  - Auto-update (#763): check the release feed, verified download, swap on
+    restart.
   - Lib follow-up: shutdown handles for the watcher/admin listeners so Stop
     fully tears the core down (today Stop only halts the SOCKS5 server).
 
