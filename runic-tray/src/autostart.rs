@@ -42,7 +42,13 @@ mod imp {
         let subkey = wide(RUN_SUBKEY);
         let mut hkey = HKEY::default();
         let rc = unsafe {
-            RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(subkey.as_ptr()), 0, access, &mut hkey)
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(subkey.as_ptr()),
+                0,
+                access,
+                &mut hkey,
+            )
         };
         if rc != ERROR_SUCCESS {
             bail!("RegOpenKeyExW(Run) failed: {rc:?}");

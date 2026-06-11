@@ -28,6 +28,9 @@ anyhow = "1"
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# File sink for the tray log (stderr is lost under windows_subsystem="windows");
+# "Show logs" opens %APPDATA%\runic\runic-tray.log written via this appender.
+tracing-appender = "0.2"
 
 # GUI / tray (fetched + built on Windows; versions to confirm on first build):
 tao = "0.30"
@@ -38,6 +41,9 @@ tray-icon = "0.19"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_Registry",
+    # Native toast notifications (WinRT), see src/toast.rs.
+    "UI_Notifications",
+    "Data_Xml_Dom",
 ] }
 
 [build-dependencies]
