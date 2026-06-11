@@ -1,0 +1,56 @@
+# Continuous test-gate: runs on every push to main and on every PR.
+#
+# Two crates, each checked on its primary platform:
+#   - the core lib+CLI (`runic`) is cross-platform but Linux is its main target,
+#     so it gets the full fmt + clippy + test gate on ubuntu.
+#   - `runic-tray` is a standalone crate (not a workspace member) with
+#     cfg(windows) code that only compiles under MSVC, so it is gated on
+#     windows-latest (fmt + clippy, which also compiles it).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core:
+    name: core — fmt / clippy / test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: test
+        run: cargo test --all
+
+  tray:
+    name: tray — fmt / clippy (Windows/MSVC)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: runic-tray
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runic-tray
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings

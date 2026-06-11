@@ -1,0 +1,55 @@
+# Publish a core/CLI (`runic`) release when a bare `vX.Y.Z` tag is pushed.
+#
+# Tag scheme (mirror of release-tray): the core/lib/CLI uses a bare `vX.Y.Z`
+# while the tray uses `tray-vX.Y.Z`. The `v*` filter never matches `tray-v*`
+# (different prefix), so the two release pipelines never collide.
+#
+# Builds a static x86_64 musl binary (no glibc version coupling — runs on any
+# Linux), tars it with the READMEs/licenses, writes a SHA256 sidecar, and
+# publishes a GitHub Release. Creating a public Release is irreversible, so this
+# only ever runs from an explicit tag push.
+name: release-core
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # needed to create the GitHub Release
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build static binary
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl --bin runic
+
+      - name: Package + checksum + publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          pkg="runic-${version}-x86_64-linux-musl"
+          mkdir -p "dist/${pkg}"
+          cp target/x86_64-unknown-linux-musl/release/runic "dist/${pkg}/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/${pkg}/"
+          tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
+          ( cd dist && sha256sum "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256" )
+          gh release create "${version}" \
+            "dist/${pkg}.tar.gz" "dist/${pkg}.tar.gz.sha256" \
+            --title "runic ${version}" \
+            --generate-notes
