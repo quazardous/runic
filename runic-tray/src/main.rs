@@ -385,6 +385,9 @@ fn open_path(path: &Path) -> Result<()> {
 }
 
 /// Open the config file, seeding a commented example if it doesn't exist yet.
+/// Prefer Notepad: the default `.yaml` handler is often a heavy editor (VS Code)
+/// — for a quick config tweak a plain text editor is friendlier. Fall back to
+/// the default handler if Notepad can't be launched.
 fn open_config(path: &Path) -> Result<()> {
     if !path.exists() {
         if let Some(dir) = path.parent() {
@@ -392,7 +395,15 @@ fn open_config(path: &Path) -> Result<()> {
         }
         std::fs::write(path, CONFIG_EXAMPLE)?;
     }
-    open_path(path)
+    if std::process::Command::new("notepad.exe")
+        .arg(path)
+        .spawn()
+        .is_ok()
+    {
+        Ok(())
+    } else {
+        open_path(path)
+    }
 }
 
 /// Initialise tracing to a file so logs survive `windows_subsystem="windows"`
