@@ -87,7 +87,7 @@ listen:
   auth: none
 
 admin:                        # optional; runtime/permanent admin API (v0.6), loopback only
-  addr: "127.0.0.1:7778"
+  addr: "127.0.0.1:48484"
 
 upstreams:                    # pool keyed by name; the routing layer picks per session (v0.7)
   default:                    # this release routes all traffic through `default`
@@ -117,7 +117,7 @@ runic [--config /etc/runic/runic.yaml] [--log <env_filter>]
 
 - **Loopback only.** The `127.0.0.1:` prefix in any port mapping is
   load-bearing — don't drop it, the SOCKS5 surface has no auth.
-- **Admin API is loopback + unauthenticated** by default (`127.0.0.1:7778`):
+- **Admin API is loopback + unauthenticated** by default (`127.0.0.1:48484`):
   the bind address is the trust boundary. `runic.snapshot.json` stores upstream
   credentials in clear (written `0600`) — treat it as a secret-bearing file.
 - **Logs are plain stdout/stderr**, structured via `tracing`. `RUNIC_LOG` is an

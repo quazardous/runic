@@ -89,11 +89,11 @@ mode it needs:
 
 ```bash
 # First run: get a token, keep it safe (runic won't show it again).
-curl -X POST http://127.0.0.1:7778/v1/silo/open
+curl -X POST http://127.0.0.1:48484/v1/silo/open
 # → {"token":"q1w2...e3r4"}                     (instance default mode)
 
 # Browser deployment, no cold YAML: ask for a no-auth port up front.
-curl -X POST http://127.0.0.1:7778/v1/silo/open -d '{"mode":"none"}'
+curl -X POST http://127.0.0.1:48484/v1/silo/open -d '{"mode":"none"}'
 # → {"token":"q1w2...e3r4","port":41987}
 ```
 
@@ -102,7 +102,7 @@ curl -X POST http://127.0.0.1:7778/v1/silo/open -d '{"mode":"none"}'
 Use the existing upstream routes, scoped to your silo with the token:
 
 ```bash
-curl -X POST http://127.0.0.1:7778/v1/upstreams/dataimpulse \
+curl -X POST http://127.0.0.1:48484/v1/upstreams/dataimpulse \
   -H 'authorization: Bearer q1w2...e3r4' \
   -d '{"kind":"http_connect","host":"gw.example","port":823,
        "auth":{"username":"u","password":"p"}}'
@@ -147,7 +147,7 @@ browsers — they only offer no-auth SOCKS5). The client opens its silo over the
 admin API and gets back a **dedicated loopback port**:
 
 ```bash
-curl -X POST http://127.0.0.1:7778/v1/silo/open \
+curl -X POST http://127.0.0.1:48484/v1/silo/open \
   -H 'authorization: Bearer q1w2...e3r4'
 # → {"port":41987}
 ```
