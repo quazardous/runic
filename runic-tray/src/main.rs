@@ -15,9 +15,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod autostart;
+mod toast;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -41,6 +42,26 @@ const ROUTE_UNKNOWN: u8 = 0; // status not reachable yet
 const ROUTE_PROXIED: u8 = 1; // active route exits through a proxy upstream
 const ROUTE_DIRECT: u8 = 2; // a direct (non-proxied) route is active — local IP exposed
 const ROUTE_NOROUTE: u8 = 3; // no active route (empty pool / boot-empty)
+
+/// Events delivered into the tao loop. Menu clicks arrive from the global menu
+/// handler; `Toast` lets a background tokio task (e.g. Show IP) marshal a result
+/// string back so the toast is shown on the UI thread, where COM is initialised.
+enum UserEvent {
+    Menu(MenuEvent),
+    Toast { title: String, body: String },
+}
+
+/// A minimal commented config written on first "Open config file" when none
+/// exists yet (boot-empty model: upstreams are pushed later over the admin API).
+const CONFIG_EXAMPLE: &str = "\
+# runic configuration — SOCKS5 listener + upstreams.
+# The tray runs boot-empty: add upstreams here or push them over the admin API.
+# Docs: https://github.com/quazardous/runic
+listen:
+  addr: \"127.0.0.1:1080\"
+  auth: none
+upstreams: {}
+";
 
 /// Owns the tokio runtime and the running proxy tasks. Start spins the core up;
 /// Stop aborts the SOCKS5 server task.
@@ -79,6 +100,13 @@ impl Supervisor {
             .as_ref()
             .map(|t| !t.is_finished())
             .unwrap_or(false)
+    }
+
+    /// Current SOCKS5 listen address from the live config (None before boot).
+    /// Read fresh each call so a config change flowing through the watcher is
+    /// reflected — "Show current IP" dials this to reach the proxy.
+    fn socks_addr(&self) -> Option<SocketAddr> {
+        self.cfg_rx.as_ref().map(|rx| rx.borrow().listen.addr)
     }
 
     /// Bring up the app-lifetime infrastructure exactly once: cold load →
@@ -282,13 +310,126 @@ async fn fetch_route(addr: SocketAddr) -> u8 {
     inner(addr).await.unwrap_or(ROUTE_UNKNOWN)
 }
 
+/// Fetch the public IP as seen THROUGH the local SOCKS5 proxy (so it reflects
+/// the active upstream, not the host). Speaks just enough SOCKS5 by hand and
+/// uses the domain address type so the proxy resolves `api.ipify.org` — no
+/// local DNS, and it works even when the host can't reach the internet directly.
+async fn fetch_public_ip(socks: SocketAddr) -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // A 0.0.0.0 bind isn't connectable — dial loopback on the same port.
+    let target = if socks.ip().is_unspecified() {
+        SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), socks.port())
+    } else {
+        socks
+    };
+    let mut s = tokio::net::TcpStream::connect(target).await?;
+
+    // Greeting: VER=5, one method, NO-AUTH.
+    s.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut method = [0u8; 2];
+    s.read_exact(&mut method).await?;
+    anyhow::ensure!(method == [0x05, 0x00], "SOCKS5 no-auth negotiation failed");
+
+    // CONNECT api.ipify.org:80 (ATYP=domain → the proxy resolves the host).
+    let host = b"api.ipify.org";
+    let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+    req.extend_from_slice(host);
+    req.extend_from_slice(&80u16.to_be_bytes());
+    s.write_all(&req).await?;
+
+    // Reply: VER REP RSV ATYP BND.ADDR BND.PORT — REP 0 = success.
+    let mut head = [0u8; 4];
+    s.read_exact(&mut head).await?;
+    anyhow::ensure!(
+        head[1] == 0x00,
+        "SOCKS5 connect rejected (code {})",
+        head[1]
+    );
+    let bnd = match head[3] {
+        0x01 => 4,
+        0x04 => 16,
+        0x03 => {
+            let mut len = [0u8; 1];
+            s.read_exact(&mut len).await?;
+            len[0] as usize
+        }
+        other => anyhow::bail!("unexpected SOCKS5 ATYP {other}"),
+    };
+    let mut bound = vec![0u8; bnd + 2]; // addr + port, discarded
+    s.read_exact(&mut bound).await?;
+
+    // ipify returns the bare IP as the body.
+    s.write_all(
+        b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\nUser-Agent: runic-tray\r\n\r\n",
+    )
+    .await?;
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await?;
+    let text = String::from_utf8_lossy(&buf);
+    let ip = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("empty response from ipify"))?;
+    Ok(ip.to_string())
+}
+
+/// Open a path with its Windows default handler (`cmd /C start "" <path>`).
+fn open_path(path: &Path) -> Result<()> {
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", &path.to_string_lossy()])
+        .spawn()?;
+    Ok(())
+}
+
+/// Open the config file, seeding a commented example if it doesn't exist yet.
+fn open_config(path: &Path) -> Result<()> {
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, CONFIG_EXAMPLE)?;
+    }
+    open_path(path)
+}
+
+/// Initialise tracing to a file so logs survive `windows_subsystem="windows"`
+/// (no console in release). Returns the log path for "Show logs", plus the
+/// appender guard, which the caller must keep alive for the process lifetime so
+/// the non-blocking writer keeps flushing.
+fn init_logging() -> (
+    Option<PathBuf>,
+    Option<tracing_appender::non_blocking::WorkerGuard>,
+) {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("RUNIC_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("runic=info"));
+    let dir = runic::paths::default_config_path()
+        .parent()
+        .map(Path::to_path_buf);
+    match dir {
+        Some(dir) if std::fs::create_dir_all(&dir).is_ok() => {
+            let (writer, guard) =
+                tracing_appender::non_blocking(tracing_appender::rolling::never(&dir, LOG_FILE));
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(writer)
+                .init();
+            (Some(dir.join(LOG_FILE)), Some(guard))
+        }
+        _ => {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+            (None, None)
+        }
+    }
+}
+
+const LOG_FILE: &str = "runic-tray.log";
+
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("RUNIC_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("runic=info")),
-        )
-        .init();
+    let (log_path, _log_guard) = init_logging();
 
     // Shared with the CLI: `%APPDATA%\runic\runic.yaml` on Windows (single
     // source of truth in `runic::paths`, no divergent copy here).
@@ -327,11 +468,14 @@ fn main() -> Result<()> {
 
     // Event loop with a user-event channel; forward menu clicks into it so the
     // loop wakes on menu activity (Wait control flow otherwise sleeps).
-    let event_loop = EventLoopBuilder::<MenuEvent>::with_user_event().build();
+    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
-        let _ = proxy.send_event(e);
+        let _ = proxy.send_event(UserEvent::Menu(e));
     }));
+    // A second proxy the loop hands to background tasks (Show IP) to marshal a
+    // toast string back onto the UI thread.
+    let toast_proxy = event_loop.create_proxy();
 
     // Icon size: 32 px renders crisply and Windows downscales for the taskbar.
     const ICON_PX: u32 = 32;
@@ -371,6 +515,20 @@ fn main() -> Result<()> {
 
     let config_path = runic::paths::default_config_path();
 
+    // The "popup that identifies it" david asked for — the icon otherwise lands
+    // silently (Windows 11 even hides it in the overflow).
+    toast::toast(
+        "runic ᚱ",
+        if matches!(initial_state, IconState::Running) {
+            "démarré"
+        } else {
+            "démarré (proxy arrêté)"
+        },
+    );
+
+    // Last start/restart error, surfaced by the Status toast.
+    let mut last_error: Option<String> = None;
+
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + POLL_EVERY);
 
@@ -392,12 +550,17 @@ fn main() -> Result<()> {
                 };
                 set_state(&tray, state);
             }
-            tao::event::Event::UserEvent(menu_event) => {
+            // A background task (Show IP) finished and handed back a toast.
+            tao::event::Event::UserEvent(UserEvent::Toast { title, body }) => {
+                toast::toast(&title, &body);
+            }
+            tao::event::Event::UserEvent(UserEvent::Menu(menu_event)) => {
                 match menu_event.id {
                     id if id == start_i.id() => match supervisor.start() {
                         Ok(()) => set_state(&tray, IconState::Running),
                         Err(e) => {
                             tracing::error!(error = %e, "start failed");
+                            last_error = Some(e.to_string());
                             set_state(&tray, IconState::Error);
                         }
                     },
@@ -409,30 +572,56 @@ fn main() -> Result<()> {
                         Ok(()) => set_state(&tray, IconState::Running),
                         Err(e) => {
                             tracing::error!(error = %e, "restart failed");
+                            last_error = Some(e.to_string());
                             set_state(&tray, IconState::Error);
                         }
                     },
                     id if id == status_i.id() => {
-                        let state = if supervisor.is_running() {
-                            "running"
+                        let body = if supervisor.is_running() {
+                            match route.load(Ordering::Relaxed) {
+                                ROUTE_DIRECT => "running — route DIRECTE (IP exposée)".to_string(),
+                                ROUTE_NOROUTE => "running — aucune route (pool vide)".to_string(),
+                                _ => "running — proxifié".to_string(),
+                            }
+                        } else if let Some(e) = &last_error {
+                            format!("stopped — dernière erreur : {e}")
                         } else {
-                            "stopped"
+                            "stopped".to_string()
                         };
-                        tracing::info!(%state, "status");
-                        // TODO: surface via a native Windows toast instead of a log line.
+                        toast::toast("runic — status", &body);
                     }
-                    id if id == ip_i.id() => {
-                        // TODO: issue an internal request through the local SOCKS5 to
-                        // api.ipify.org on the tokio runtime and show the IP in a toast.
-                    }
+                    id if id == ip_i.id() => match supervisor.socks_addr() {
+                        Some(addr) if supervisor.is_running() => {
+                            // Network I/O on the runtime; the result is marshaled
+                            // back as a Toast event so it shows on the UI thread.
+                            let proxy = toast_proxy.clone();
+                            supervisor.rt.handle().spawn(async move {
+                                let (title, body) = match fetch_public_ip(addr).await {
+                                    Ok(ip) => ("runic — IP publique", ip),
+                                    Err(e) => ("runic — IP", format!("échec : {e}")),
+                                };
+                                let _ = proxy.send_event(UserEvent::Toast {
+                                    title: title.to_string(),
+                                    body,
+                                });
+                            });
+                        }
+                        _ => toast::toast("runic — IP", "proxy arrêté — démarre-le d'abord"),
+                    },
                     id if id == config_i.id() => {
-                        // TODO: open the YAML in the default editor
-                        // (std::process::Command "cmd /C start" on the config path).
-                        let _ = &config_path;
+                        if let Err(e) = open_config(&config_path) {
+                            tracing::error!(error = %e, "open config failed");
+                            toast::toast("runic", &format!("ouverture config échouée : {e}"));
+                        }
                     }
-                    id if id == logs_i.id() => {
-                        // TODO: open the log file / a simple log window.
-                    }
+                    id if id == logs_i.id() => match &log_path {
+                        Some(p) => {
+                            if let Err(e) = open_path(p) {
+                                tracing::error!(error = %e, "open logs failed");
+                            }
+                        }
+                        None => toast::toast("runic", "journal indisponible"),
+                    },
                     id if id == autostart_i.id() => {
                         // Target the opposite of what's actually persisted, write it,
                         // then force the checkmark to mirror reality so a failed write
