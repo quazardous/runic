@@ -1,0 +1,28 @@
+# Default runic config, installed at /etc/runic/runic.yaml.
+# Marked as a package config file: your edits survive upgrades.
+#
+# runic boots with an empty pool — it accepts no traffic until at least one
+# upstream is configured, here or live via the admin API. An unmatched session
+# is refused, never sent out un-proxied. Docs: /usr/share/doc/runic/ and
+# https://github.com/quazardous/runic
+#
+# After editing:  sudo systemctl restart runic   (config is also hot-reloaded)
+
+listen:
+  addr: "127.0.0.1:7777"    # SOCKS5, loopback only (no auth)
+  auth: none
+
+admin:
+  addr: "127.0.0.1:48484"   # loopback admin API + status page (http://127.0.0.1:48484/)
+
+# Add at least one upstream to carry traffic, e.g.:
+#
+# upstreams:
+#   default:
+#     kind: http_connect
+#     host: gw.example.com
+#     port: 823
+#     auth:
+#       username_env: RUNIC_UPSTREAM_USER   # set these in /etc/runic/runic.env
+#       password_env: RUNIC_UPSTREAM_PASS
+upstreams: {}
