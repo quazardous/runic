@@ -1,6 +1,17 @@
+# Single source of truth for the whole product's version (core + tray).
+# Both crates inherit it via `version.workspace = true`, so they can never drift.
+[workspace]
+members = ["runic-tray"]
+default-members = ["."]   # `cargo build`/`test` (no -p) = core only; the tray's
+                          # Windows-only deps don't compile on Linux, so it is
+                          # built by its own dedicated job.
+
+[workspace.package]
+version = "0.2.0"
+
 [package]
 name = "runic"
-version = "0.2.0"
+version.workspace = true
 edition = "2021"
 description = "Local SOCKS5 proxy that relays via HTTP CONNECT upstream"
 license = "MIT OR Apache-2.0"

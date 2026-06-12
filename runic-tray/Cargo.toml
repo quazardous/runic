@@ -1,10 +1,14 @@
 # runic-tray — Windows system-tray front-end over the `runic` core library.
 #
-# STANDALONE crate on purpose: it is NOT a member of the root build, so the
-# Linux CLI build / `cargo test` at the repo root never touch it (its GUI deps
-# need Windows and aren't fetched on the Linux box). Build it ON WINDOWS:
-#   cd runic-tray && cargo build --release
+# Workspace member, but EXCLUDED from the default build (`default-members` in
+# the root Cargo.toml = core only). Its GUI deps need Windows and aren't fetched
+# on the Linux box, so the Linux CLI build / `cargo test -p runic` never touch
+# it. Build it ON WINDOWS:
+#   cargo build -p runic-tray --release      # (or: cd runic-tray && cargo build)
 # See ../docs/dev/windows-setup.md.
+#
+# Version is inherited from the workspace (`version.workspace = true`) so the
+# core and the tray share one version, by construction.
 #
 # Built and verified on Windows 11: the dep versions below (tao 0.30 /
 # tray-icon 0.19 / windows 0.58) compile and run on both the GNU and MSVC
@@ -12,7 +16,7 @@
 
 [package]
 name = "runic-tray"
-version = "0.2.0"
+version.workspace = true
 edition = "2021"
 authors = ["David Berlioz <berliozdavid@gmail.com>"]
 description = "Windows system-tray front-end for runic"

@@ -3,9 +3,10 @@
 # Two crates, each checked on its primary platform:
 #   - the core lib+CLI (`runic`) is cross-platform but Linux is its main target,
 #     so it gets the full fmt + clippy + test gate on ubuntu.
-#   - `runic-tray` is a standalone crate (not a workspace member) with
-#     cfg(windows) code that only compiles under MSVC, so it is gated on
-#     windows-latest with a plain `cargo build` — a compile check so the core
+#   - `runic-tray` is a workspace member but excluded from the default build
+#     (its cfg(windows) deps only compile under MSVC). The core job scopes to
+#     `-p runic` so Linux never tries to build it; the tray is gated separately
+#     on windows-latest with a plain `cargo build` — a compile check so the core
 #     can't silently break the tray. fmt/clippy on the tray are the tray
 #     owner's call (its sources aren't enrolled in this gate).
 name: ci
@@ -32,23 +33,18 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: rustfmt
-        run: cargo fmt --all --check
+        run: cargo fmt -p runic --check
       - name: clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy -p runic --all-targets --all-features -- -D warnings
       - name: test
-        run: cargo test --all
+        run: cargo test -p runic
 
   tray:
     name: tray — build (Windows/MSVC)
     runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: runic-tray
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: runic-tray
       - name: build
-        run: cargo build --all-targets
+        run: cargo build -p runic-tray --all-targets

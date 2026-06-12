@@ -21,8 +21,11 @@ $tray = Join-Path $repo 'runic-tray'
 $mingw = 'C:\msys64\mingw64\bin'
 if (Test-Path $mingw) { $env:PATH = "$mingw;$env:PATH" }
 
-# Version from the crate manifest ([package] version, anchored to line start).
-$ver = (Select-String -Path (Join-Path $tray 'Cargo.toml') -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+# Version via cargo metadata — robust to the workspace-inherited version
+# (`version.workspace = true`), where there is no literal `version = "..."` line
+# in runic-tray/Cargo.toml to grep.
+$meta = cargo metadata --no-deps --format-version 1 --manifest-path (Join-Path $tray 'Cargo.toml') | ConvertFrom-Json
+$ver = ($meta.packages | Where-Object { $_.name -eq 'runic-tray' }).version
 Write-Host "runic-tray $ver — building release..."
 
 cargo build --release --manifest-path (Join-Path $tray 'Cargo.toml')

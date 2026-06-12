@@ -43,7 +43,9 @@ if (-not $haveCandle) {
     }
 }
 
-$ver = (Select-String -Path (Join-Path $tray 'Cargo.toml') -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+# Version via cargo metadata — robust to the workspace-inherited version.
+$meta = cargo metadata --no-deps --format-version 1 --manifest-path (Join-Path $tray 'Cargo.toml') | ConvertFrom-Json
+$ver = ($meta.packages | Where-Object { $_.name -eq 'runic-tray' }).version
 Write-Host "runic-tray $ver — building MSI..."
 
 # cargo wix builds the release binary then runs candle/light.
