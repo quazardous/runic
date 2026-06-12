@@ -1,54 +1,179 @@
-# Publish a runic-tray Windows release when a `tray-v*` tag is pushed.
+# Unified release: ONE `vX.Y.Z` tag → ONE GitHub Release with every artifact.
 #
-# Tag scheme: tray releases are `tray-vX.Y.Z` (the core/lib/CLI uses a bare
-# `vX.Y.Z`), so this workflow only fires for the tray and never collides with
-# core tags. The auto-updater filters GitHub releases on the `tray-` prefix.
+# Single version system (workspace-inherited) + single pipeline. A matrix of
+# native runners each builds its platform's binaries; a final `publish` job
+# gathers them all into one Release:
 #
-# Runs on windows-latest, which uses the MSVC toolchain by default — the exe
-# icon embeds via rc.exe, so no mingw/PATH tweak is needed (unlike a local GNU
-# build). package.ps1 skips its mingw step when that path is absent.
-name: release-tray
+#   Linux   (ubuntu)  : runic  x86_64-musl (+ .deb + .rpm)  and  aarch64-musl
+#   macOS   (macos)   : runic  x86_64  and  aarch64 (Apple Silicon)
+#   Windows (windows) : runic.exe (core CLI)  +  runic-tray.exe ZIP  +  MSI
+#
+# Supersedes the old split (release-core `v*` / release-tray `tray-v*`). The
+# tray's build steps (package.ps1 → cargo-wix → msi.ps1) are reused verbatim.
+#
+# runic-win NOTE: the tray auto-updater must filter `v*` (was `tray-v`) to
+# self-update from these unified releases — see update.rs.
+name: release
 
 on:
   push:
     tags:
-      - "tray-v*"
+      - "v*"
 
 permissions:
   contents: write # needed to create the GitHub Release
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  # ---- Linux: musl static binary (+ native packages for x86_64) -------------
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            packages: true
+          - target: aarch64-unknown-linux-musl
+            packages: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: cargo-bins/cargo-binstall@main
+      - name: Tooling
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          cargo binstall -y cross cargo-deb cargo-generate-rpm
+      - name: Build
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            cross build --release --locked --target ${{ matrix.target }} -p runic
+          else
+            cargo build --release --locked --target ${{ matrix.target }} -p runic
+          fi
+      - name: Package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          tgt="${{ matrix.target }}"
+          pkg="runic-${version}-${tgt}"
+          mkdir -p "dist/${pkg}"
+          cp "target/${tgt}/release/runic" "dist/${pkg}/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/${pkg}/"
+          tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
+          rm -rf "dist/${pkg}"
+          if [ "${{ matrix.packages }}" = "true" ]; then
+            cargo deb --no-build --target "$tgt"
+            cargo generate-rpm --target "$tgt"
+            cp "$(find target -name 'runic_*.deb' | head -1)" dist/
+            cp "$(find target -name 'runic-*.rpm' | head -1)" dist/
+          fi
+          ( cd dist && for f in *.tar.gz *.deb *.rpm; do [ -e "$f" ] && sha256sum "$f" > "$f.sha256"; done; true )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.target }}
+          path: dist/*
+
+  # ---- macOS: x86_64 + Apple Silicon ---------------------------------------
+  macos:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p runic
+      - name: Package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          pkg="runic-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${pkg}"
+          cp "target/${{ matrix.target }}/release/runic" "dist/${pkg}/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/${pkg}/"
+          tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
+          rm -rf "dist/${pkg}"
+          ( cd dist && shasum -a 256 "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256" )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.target }}
+          path: dist/*
+
+  # ---- Windows: core runic.exe + tray ZIP + MSI ----------------------------
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Build + package portable ZIP
+      - name: Build core runic.exe
+        shell: pwsh
+        run: cargo build --release --locked -p runic
+
+      - name: Build tray portable ZIP
         shell: pwsh
         run: .\packaging\windows\package.ps1
 
-      # windows-latest ships WiX v3 (candle/light) with %WIX% set; cargo-wix is
-      # the only missing piece. msi.ps1 picks WiX up from %WIX% automatically.
+      # windows-latest ships WiX v3 with %WIX% set; cargo-wix is the missing piece.
       - name: Install cargo-wix
         shell: pwsh
         run: cargo install cargo-wix --locked
 
-      - name: Build + package MSI installer
+      - name: Build MSI installer
         shell: pwsh
         run: .\packaging\windows\msi.ps1
 
-      - name: Checksum + publish release
+      - name: Assemble core zip + checksums
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          $assets = @()
-          foreach ($a in (Get-ChildItem dist\runic-tray-*-windows-x64.zip, dist\runic-tray-*-windows-x64.msi)) {
+          $version = "${{ github.ref_name }}"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          # core CLI zip (the tray ZIP + MSI are already in dist from the steps above)
+          $coredir = "runic-$version-x86_64-windows"
+          New-Item -ItemType Directory -Force "dist\$coredir" | Out-Null
+          Copy-Item target\release\runic.exe "dist\$coredir\"
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE "dist\$coredir\"
+          Compress-Archive -Path "dist\$coredir\*" -DestinationPath "dist\$coredir.zip" -Force
+          Remove-Item -Recurse -Force "dist\$coredir"
+          foreach ($a in (Get-ChildItem dist\*.zip, dist\*.msi)) {
             $sha = "$($a.FullName).sha256"
             $hash = (Get-FileHash $a.FullName -Algorithm SHA256).Hash.ToLower()
             "$hash  $($a.Name)" | Set-Content -Path $sha -Encoding ascii
-            $assets += $a.FullName; $assets += $sha
           }
-          gh release create "${{ github.ref_name }}" @assets `
-            --title "runic-tray ${{ github.ref_name }}" `
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  # ---- Gather everything into ONE Release ----------------------------------
+  publish:
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the unified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -la dist
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "runic ${GITHUB_REF_NAME}" \
             --generate-notes
