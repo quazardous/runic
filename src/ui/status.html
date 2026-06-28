@@ -8,7 +8,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>runic ᚱ status</title>
+<title>runic — status</title>
 <style>
   :root {
     --teal: #149e9e; --amber: #e08a16; --blue: #3b82f6; --red: #d63b3b;
@@ -19,7 +19,7 @@
          font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   header { display: flex; align-items: baseline; gap: .6rem; padding: 1rem 1.25rem;
            border-bottom: 1px solid var(--line); }
-  header .rune { color: var(--teal); font-size: 1.6rem; }
+  header .rune { color: var(--teal); width: 1.05rem; height: 1.5rem; flex: none; align-self: center; }
   header h1 { margin: 0; font-size: 1.05rem; font-weight: 600; letter-spacing: .03em; }
   header .ver { color: var(--dim); }
   header .conn { margin-left: auto; color: var(--dim); font-size: .85rem; }
@@ -56,7 +56,11 @@
 </head>
 <body>
 <header>
-  <span class="rune">ᚱ</span>
+  <!-- Raidho rune (U+16B1) drawn inline so the brand mark never depends on a
+       runic-capable font — a bare glyph renders as tofu on most systems. -->
+  <svg class="rune" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+       stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"
+       aria-label="runic" role="img"><path d="M6 2 V22 M6 2 H15 L6 12 M6 12 L16 22"/></svg>
   <h1>runic</h1>
   <span class="ver" id="ver"></span>
   <span class="conn" id="conn">connecting…</span>
