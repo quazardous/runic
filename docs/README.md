@@ -4,8 +4,9 @@ Install guides per OS:
 
 - [`install/docker.md`](install/docker.md) — Docker sidecar (OS-agnostic, what
   the root `README.md` quick-starts you with).
-- [`install/linux-systemd.md`](install/linux-systemd.md) — Linux, per-user
-  systemd unit, with hot-reload on config change.
+- [`install/linux-systemd.md`](install/linux-systemd.md) — Linux: `.deb`/`.rpm`
+  package (system service), prebuilt binary, or build from source (per-user
+  systemd unit). Hot-reload on config change.
 
 Feature guides:
 

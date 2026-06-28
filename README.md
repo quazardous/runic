@@ -81,8 +81,9 @@ Per-OS install guides live in [`docs/`](docs/README.md):
 
 - [`docs/install/docker.md`](docs/install/docker.md) — Docker sidecar
   (OS-agnostic, fastest path to a running service).
-- [`docs/install/linux-systemd.md`](docs/install/linux-systemd.md) — Linux,
-  per-user systemd unit, with hot-reload on config change.
+- [`docs/install/linux-systemd.md`](docs/install/linux-systemd.md) — Linux:
+  `.deb`/`.rpm` package (system service), prebuilt binary, or build from source
+  (per-user service). With hot-reload on config change.
 - [`docs/install/socks5-routing.md`](docs/install/socks5-routing.md) —
   Multi-provider routing via the SOCKS5 username (clients pick which
   upstream of the pool to use per session).

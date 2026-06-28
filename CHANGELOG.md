@@ -11,6 +11,8 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-28
+
 ### Added
 
 - **A live status page.** The admin API now serves a small self-contained web
@@ -60,6 +62,12 @@ humans, not machines"), and the project follows
   passthrough). The `kind: "direct"` contract — allowed by default, always
   explicit, `RUNIC_ALLOW_DIRECT=0` to forbid — and its canonical request body
   (`kind` alone) are now documented.
+
+- **Linux install guide now covers the easy paths.** The Linux doc previously
+  only walked through a from-source build; it now leads with installing the
+  `.deb`/`.rpm` package (system service, hardened `DynamicUser`) and the
+  prebuilt static binary, keeping the from-source per-user systemd unit as the
+  no-root alternative — and points at the live status page once running.
 
 ## [0.2.0] - 2026-06-02
 
