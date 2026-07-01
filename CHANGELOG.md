@@ -11,6 +11,24 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+### Added
+
+- **Domain filtering at the CONNECT layer.** runic can now allow or deny a
+  session by its target host, before opening the tunnel — an ordered
+  allow/deny rule list (first-match-wins, like a firewall chain) with a default
+  action. The same engine expresses a blocklist (`default: allow` + `deny`
+  rules) or a strict allowlist (`default: deny` + `allow` rules); patterns match
+  an exact host, a `*.` subdomain wildcard, and an optional `:port`. This cuts
+  bandwidth for scraping (block image CDNs, ad/tracker hosts) and locks a proxy
+  to known destinations — all **without any TLS interception**: runic still only
+  ever sees the target host, never the encrypted payload. A blocked target is
+  refused with the SOCKS5 "connection not allowed by ruleset" reply, and no
+  upstream quota is spent on it. Configure it in the YAML (`filter:` section),
+  live via the admin API (`GET/PUT/DELETE /v1/filter`, firewalld-style
+  runtime/permanent), and — in silo mode — per client inside each encrypted
+  variation config. The status page shows the filter posture and a cumulative
+  count of blocked CONNECTs. See [`docs/install/filtering.md`](docs/install/filtering.md).
+
 ## [0.3.0] - 2026-06-28
 
 ### Added

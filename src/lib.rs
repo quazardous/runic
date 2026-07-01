@@ -12,6 +12,7 @@
 
 pub mod admin;
 pub mod config;
+pub mod filter;
 pub mod paths;
 pub mod routing;
 pub mod server;

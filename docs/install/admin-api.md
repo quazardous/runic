@@ -87,6 +87,9 @@ upstreams:
 | `DELETE /v1/snapshot` | wipe the snapshot file; next boot = cold YAML only |
 | `PUT /v1/route/default` | point the default (no-provider) route at a named upstream — body `{"upstream":"<name>"}` (runtime only) |
 | `DELETE /v1/route/default` | clear the pointer; the default route falls back to the `default` entry |
+| `GET /v1/filter` | the effective domain filter (hot ▷ snapshot ▷ cold). With a silo `Bearer`, that variation's own filter |
+| `PUT /v1/filter` | replace the whole domain filter (runtime; `?permanent=true` persists). With a silo `Bearer`, write-through to that variation. See [`filtering.md`](filtering.md) |
+| `DELETE /v1/filter` | clear the runtime filter override (`?permanent=true` clears the snapshot too). With a silo `Bearer`, clear that variation's filter |
 
 ## Status surface
 

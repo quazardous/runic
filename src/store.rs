@@ -27,6 +27,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, Upstream};
+use crate::filter::FilterRules;
 
 /// On-disk snapshot schema version. Bump on a breaking format change; older
 /// files are tolerated (logged) so a downgrade never hard-fails the boot.
@@ -47,6 +48,11 @@ pub enum Source {
 struct SnapshotFile {
     version: u32,
     upstreams: BTreeMap<String, Upstream>,
+    /// Permanent domain-filter override. `#[serde(default)]` so snapshots
+    /// written before the filter existed load as "no override" (fall back to
+    /// the cold YAML filter).
+    #[serde(default)]
+    filter: Option<FilterRules>,
 }
 
 /// One row of the layer diff (`/v1/diff`): a name defined in more than one
@@ -70,6 +76,11 @@ pub struct ConfigStore {
     /// Active-route pointer (admin `PUT /v1/route/default`). Runtime only — not
     /// persisted to the snapshot. `None` falls back to the `default` entry.
     active_route: Option<String>,
+    /// Runtime (RAM-only) domain-filter override — admin `PUT /v1/filter`.
+    filter_hot: Option<FilterRules>,
+    /// Permanent domain-filter override — persisted in the snapshot. Shadows the
+    /// cold YAML filter; `filter_hot` shadows this in turn.
+    filter_snapshot: Option<FilterRules>,
     snapshot_path: PathBuf,
     cfg_tx: watch::Sender<Arc<Config>>,
 }
@@ -78,26 +89,36 @@ impl ConfigStore {
     /// Build a store from the cold config, loading the snapshot file if present,
     /// and return the receiver the data plane reads from.
     pub fn new(cold: Config, snapshot_path: PathBuf) -> (Self, watch::Receiver<Arc<Config>>) {
-        let snapshot = match load_snapshot(&snapshot_path) {
-            Ok(Some(map)) => {
+        let (snapshot, filter_snapshot) = match load_snapshot(&snapshot_path) {
+            Ok(Some((map, filter))) => {
                 info!(path = %snapshot_path.display(), entries = map.len(), "snapshot loaded");
-                map
+                (map, filter)
             }
-            Ok(None) => BTreeMap::new(),
+            Ok(None) => (BTreeMap::new(), None),
             Err(e) => {
                 warn!(path = %snapshot_path.display(), error = %e, "snapshot load failed; starting from cold only");
-                BTreeMap::new()
+                (BTreeMap::new(), None)
             }
         };
         let hot = BTreeMap::new();
         let active_route: Option<String> = None;
-        let merged = merge(&cold, &snapshot, &hot, &active_route);
+        let filter_hot: Option<FilterRules> = None;
+        let merged = merge(
+            &cold,
+            &snapshot,
+            &hot,
+            &active_route,
+            &filter_hot,
+            &filter_snapshot,
+        );
         let (cfg_tx, cfg_rx) = watch::channel(Arc::new(merged));
         let store = Self {
             cold: Arc::new(cold),
             snapshot,
             hot,
             active_route,
+            filter_hot,
+            filter_snapshot,
             snapshot_path,
             cfg_tx,
         };
@@ -106,7 +127,14 @@ impl ConfigStore {
 
     /// Rebuild the merged config and broadcast it. The one apply path.
     fn publish(&self) {
-        let merged = merge(&self.cold, &self.snapshot, &self.hot, &self.active_route);
+        let merged = merge(
+            &self.cold,
+            &self.snapshot,
+            &self.hot,
+            &self.active_route,
+            &self.filter_hot,
+            &self.filter_snapshot,
+        );
         // send_replace ignores the "no receivers" case — the data plane may not
         // be up yet during boot, and that's fine.
         let _ = self.cfg_tx.send(Arc::new(merged));
@@ -244,7 +272,62 @@ impl ConfigStore {
 
     /// The merged effective config (`/v1/config`).
     pub fn merged(&self) -> Config {
-        merge(&self.cold, &self.snapshot, &self.hot, &self.active_route)
+        merge(
+            &self.cold,
+            &self.snapshot,
+            &self.hot,
+            &self.active_route,
+            &self.filter_hot,
+            &self.filter_snapshot,
+        )
+    }
+
+    /// The effective global domain filter (hot ▷ snapshot ▷ cold).
+    pub fn effective_filter(&self) -> FilterRules {
+        self.filter_hot
+            .clone()
+            .or_else(|| self.filter_snapshot.clone())
+            .unwrap_or_else(|| self.cold.filter.clone())
+    }
+
+    /// Set the runtime (RAM-only) filter override and republish.
+    pub fn set_filter_runtime(&mut self, filter: FilterRules) {
+        self.filter_hot = Some(filter);
+        self.publish();
+    }
+
+    /// Set the permanent filter override (persisted in the snapshot), clearing
+    /// any shadowing runtime override so the permanent value is effective.
+    pub fn set_filter_permanent(&mut self, filter: FilterRules) -> Result<()> {
+        self.filter_hot = None;
+        self.filter_snapshot = Some(filter);
+        self.persist_snapshot()?;
+        self.publish();
+        Ok(())
+    }
+
+    /// Clear the runtime filter override; the filter falls back to snapshot/cold.
+    /// Returns whether an override was present.
+    pub fn clear_filter_runtime(&mut self) -> bool {
+        let existed = self.filter_hot.take().is_some();
+        if existed {
+            self.publish();
+        }
+        existed
+    }
+
+    /// Clear both filter overrides; the filter falls back to the cold YAML.
+    /// Returns whether any override was present.
+    pub fn clear_filter_permanent(&mut self) -> Result<bool> {
+        let in_hot = self.filter_hot.take().is_some();
+        let in_snap = self.filter_snapshot.take().is_some();
+        if in_snap {
+            self.persist_snapshot()?;
+        }
+        if in_hot || in_snap {
+            self.publish();
+        }
+        Ok(in_hot || in_snap)
     }
 
     /// The **hot** layer only (runtime-pushed, RAM-only upstreams). The status
@@ -285,7 +368,7 @@ impl ConfigStore {
     }
 
     fn persist_snapshot(&self) -> Result<()> {
-        write_snapshot(&self.snapshot_path, &self.snapshot)
+        write_snapshot(&self.snapshot_path, &self.snapshot, &self.filter_snapshot)
     }
 }
 
@@ -305,6 +388,8 @@ fn merge(
     snapshot: &BTreeMap<String, Upstream>,
     hot: &BTreeMap<String, Upstream>,
     active_route: &Option<String>,
+    filter_hot: &Option<FilterRules>,
+    filter_snapshot: &Option<FilterRules>,
 ) -> Config {
     let mut upstreams = cold.upstreams.clone();
     for (k, v) in snapshot {
@@ -313,10 +398,16 @@ fn merge(
     for (k, v) in hot {
         upstreams.insert(k.clone(), v.clone());
     }
+    // Filter precedence mirrors the upstream layers: hot ▷ snapshot ▷ cold.
+    let filter = filter_hot
+        .clone()
+        .or_else(|| filter_snapshot.clone())
+        .unwrap_or_else(|| cold.filter.clone());
     Config {
         listen: cold.listen.clone(),
         upstreams,
         active_route: active_route.clone(),
+        filter,
     }
 }
 
@@ -329,7 +420,9 @@ pub fn default_snapshot_path() -> PathBuf {
 }
 
 /// Load the snapshot if the file exists. `Ok(None)` = no file (fresh boot).
-fn load_snapshot(path: &Path) -> Result<Option<BTreeMap<String, Upstream>>> {
+/// Returns the upstream map and the optional permanent filter override.
+#[allow(clippy::type_complexity)]
+fn load_snapshot(path: &Path) -> Result<Option<(BTreeMap<String, Upstream>, Option<FilterRules>)>> {
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -344,11 +437,15 @@ fn load_snapshot(path: &Path) -> Result<Option<BTreeMap<String, Upstream>>> {
             "snapshot version mismatch; loading best-effort"
         );
     }
-    Ok(Some(file.upstreams))
+    Ok(Some((file.upstreams, file.filter)))
 }
 
 /// Atomic-replace write: temp file in the same dir (mode 600), fsync, rename.
-fn write_snapshot(path: &Path, upstreams: &BTreeMap<String, Upstream>) -> Result<()> {
+fn write_snapshot(
+    path: &Path,
+    upstreams: &BTreeMap<String, Upstream>,
+    filter: &Option<FilterRules>,
+) -> Result<()> {
     use std::io::Write;
 
     if let Some(dir) = path.parent() {
@@ -359,6 +456,7 @@ fn write_snapshot(path: &Path, upstreams: &BTreeMap<String, Upstream>) -> Result
     let file = SnapshotFile {
         version: SNAPSHOT_VERSION,
         upstreams: upstreams.clone(),
+        filter: filter.clone(),
     };
     let body = serde_json::to_vec_pretty(&file).context("serialize snapshot")?;
 
@@ -415,6 +513,7 @@ mod tests {
             },
             upstreams,
             active_route: None,
+            filter: FilterRules::default(),
         }
     }
 
@@ -455,6 +554,43 @@ mod tests {
         let (reloaded, _rx2) = store_with(cold_with(&[("default", "cold.example")]), &dir);
         assert_eq!(reloaded.merged().upstreams["us"].host, "us.example");
         assert_eq!(reloaded.diagnose()["us"], Source::Snapshot);
+    }
+
+    #[test]
+    fn filter_permanent_persists_runtime_does_not() {
+        use crate::filter::{Action, Rule};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _rx) = store_with(cold_with(&[("default", "cold.example")]), &dir);
+
+        // Runtime override — effective now, NOT on disk.
+        store.set_filter_runtime(FilterRules {
+            default: Action::Allow,
+            rules: vec![Rule::Deny("runtime.example".into())],
+            enforce_in_silo: false,
+        });
+        assert_eq!(store.merged().filter.rules.len(), 1);
+
+        // Permanent override — clears the runtime one and hits disk.
+        store
+            .set_filter_permanent(FilterRules {
+                default: Action::Deny,
+                rules: vec![Rule::Allow("api.example".into())],
+                enforce_in_silo: true,
+            })
+            .unwrap();
+
+        let (reloaded, _rx2) = store_with(cold_with(&[("default", "cold.example")]), &dir);
+        let f = reloaded.effective_filter();
+        assert_eq!(f.default, Action::Deny);
+        assert!(f.enforce_in_silo);
+        assert_eq!(f.rules, vec![Rule::Allow("api.example".into())]);
+
+        // Clearing the permanent override falls back to the cold (empty) filter.
+        let (mut reloaded2, _rx3) = store_with(cold_with(&[("default", "cold.example")]), &dir);
+        assert!(reloaded2.clear_filter_permanent().unwrap());
+        assert!(reloaded2.effective_filter().is_noop());
+        let (reloaded3, _rx4) = store_with(cold_with(&[("default", "cold.example")]), &dir);
+        assert!(reloaded3.effective_filter().is_noop());
     }
 
     #[test]

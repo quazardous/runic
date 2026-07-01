@@ -25,6 +25,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, SiloAuth, UpstreamKind, UpstreamSpec, DEFAULT_UPSTREAM_NAME};
+use crate::filter::FilterRules;
 use crate::server::SiloPorts;
 use crate::silo::{VariationCache, VariationData};
 use crate::stats::Stats;
@@ -204,6 +205,106 @@ async fn route(
                 200,
                 "OK",
                 &json!({ "active_route": serde_json::Value::Null }),
+            )
+        }
+        ("GET", "/v1/filter") => {
+            // Silo mode + Bearer ⇒ that variation's own filter; otherwise the
+            // effective global filter (hot ▷ snapshot ▷ cold).
+            if let (Some(silo), Some(token)) = (silo.as_ref(), req.bearer.as_ref()) {
+                return match silo.cache.lock().await.access(token, unix_now()) {
+                    Ok(data) => json_response(200, "OK", &json!(data.filter)),
+                    Err(_) => {
+                        json_response(404, "Not Found", &json!({ "code": "silo_token_unknown" }))
+                    }
+                };
+            }
+            let filter = store.lock().await.effective_filter();
+            json_response(200, "OK", &json!(filter))
+        }
+        ("PUT", "/v1/filter") => {
+            let filter: FilterRules = match serde_json::from_slice(&req.body) {
+                Ok(f) => f,
+                Err(e) => {
+                    return json_response(
+                        400,
+                        "Bad Request",
+                        &json!({ "error": format!("invalid filter body: {e}") }),
+                    )
+                }
+            };
+            // Silo mode + Bearer ⇒ write-through into that variation's encrypted
+            // config (the blob *is* the persistence — `?permanent` is moot).
+            if let (Some(silo), Some(token)) = (silo.as_ref(), req.bearer.as_ref()) {
+                let now = unix_now();
+                let mut cache = silo.cache.lock().await;
+                let mut data = match cache.access(token, now) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        return json_response(
+                            404,
+                            "Not Found",
+                            &json!({ "code": "silo_token_unknown" }),
+                        )
+                    }
+                };
+                data.filter = filter;
+                if let Err(e) = cache.write(token, &data, now) {
+                    return json_response(
+                        500,
+                        "Internal Server Error",
+                        &json!({ "error": e.to_string() }),
+                    );
+                }
+                return json_response(200, "OK", &json!({ "silo": true }));
+            }
+            let mut store = store.lock().await;
+            if permanent {
+                if let Err(e) = store.set_filter_permanent(filter) {
+                    return persist_error(e);
+                }
+            } else {
+                store.set_filter_runtime(filter);
+            }
+            json_response(200, "OK", &json!({ "permanent": permanent }))
+        }
+        ("DELETE", "/v1/filter") => {
+            // Silo mode + Bearer ⇒ clear that variation's own filter.
+            if let (Some(silo), Some(token)) = (silo.as_ref(), req.bearer.as_ref()) {
+                let now = unix_now();
+                let mut cache = silo.cache.lock().await;
+                let mut data = match cache.access(token, now) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        return json_response(
+                            404,
+                            "Not Found",
+                            &json!({ "code": "silo_token_unknown" }),
+                        )
+                    }
+                };
+                data.filter = FilterRules::default();
+                if let Err(e) = cache.write(token, &data, now) {
+                    return json_response(
+                        500,
+                        "Internal Server Error",
+                        &json!({ "error": e.to_string() }),
+                    );
+                }
+                return json_response(200, "OK", &json!({ "silo": true, "cleared": true }));
+            }
+            let mut store = store.lock().await;
+            let cleared = if permanent {
+                match store.clear_filter_permanent() {
+                    Ok(c) => c,
+                    Err(e) => return persist_error(e),
+                }
+            } else {
+                store.clear_filter_runtime()
+            };
+            json_response(
+                200,
+                "OK",
+                &json!({ "cleared": cleared, "permanent": permanent }),
             )
         }
         ("POST", "/v1/silo/open") => silo_open(req, silo).await,
@@ -472,6 +573,16 @@ async fn status_response(
     let active_route =
         route_named(&merged).map(|(name, kind)| json!({ "name": name, "kind": kind }));
 
+    // Compact view of the effective global filter (the full ruleset is at
+    // `GET /v1/filter`). `active` = at least one rule or a non-allow default.
+    let filter = &merged.filter;
+    let filter_json = json!({
+        "active": !filter.is_noop(),
+        "default": filter.default,
+        "rules": filter.rules.len(),
+        "enforce_in_silo": filter.enforce_in_silo,
+    });
+
     let upstreams_hot: Vec<_> = hot
         .iter()
         .map(|(name, up)| json!({ "name": name, "kind": up.kind }))
@@ -508,6 +619,7 @@ async fn status_response(
                         "route": route,
                         "connections": vs.active,
                         "requests": vs.requests,
+                        "filtered": vs.filtered,
                         "last_access_secs": idle,
                         "ttl_secs_remaining": ttl.saturating_sub(idle),
                     })
@@ -538,6 +650,9 @@ async fn status_response(
             "any_active_direct": snap.any_active_direct(),
             "active_sessions": snap.active_total,
             "requests_total": snap.requests_total,
+            // Cumulative CONNECTs refused by the domain filter.
+            "filtered_total": snap.filtered_total,
+            "filter": filter_json,
             "upstreams_hot": upstreams_hot,
             "silo": silo_json,
         }),
@@ -572,6 +687,7 @@ fn variation_route(merged: &Config, data: &VariationData) -> Option<(String, Ups
         listen: merged.listen.clone(),
         upstreams: pool,
         active_route: merged.active_route.clone(),
+        filter: merged.filter.clone(),
     };
     route_named(&cfg)
 }
@@ -701,6 +817,7 @@ mod tests {
             },
             upstreams,
             active_route: None,
+            filter: crate::filter::FilterRules::default(),
         };
         let (store, _rx) = ConfigStore::new(cold, dir.path().join("runic.snapshot.json"));
         let store = Arc::new(Mutex::new(store));
@@ -732,6 +849,7 @@ mod tests {
             },
             upstreams: BTreeMap::new(),
             active_route: None,
+            filter: crate::filter::FilterRules::default(),
         };
         let (store, cfg_rx) = ConfigStore::new(cold, dir.path().join("runic.snapshot.json"));
         let store = Arc::new(Mutex::new(store));
@@ -831,6 +949,87 @@ mod tests {
         assert!(body.contains("\"upstreams_hot\":[]"), "got: {body}");
         // No silo on this instance.
         assert!(body.contains("\"silo\":{\"enabled\":false}"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn filter_put_get_delete_roundtrip() {
+        let (addr, _dir) = test_server().await;
+
+        // Fresh instance: no filter configured.
+        let (code, body) = http(
+            addr,
+            "GET /v1/filter HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert!(body.contains("\"rules\":[]"), "got: {body}");
+
+        // PUT a blocklist at runtime.
+        let put_body =
+            r#"{"default":"allow","rules":[{"deny":"*.doubleclick.net"},{"allow":"cdn.ok.com"}]}"#;
+        let (code, _b) = http(
+            addr,
+            &format!(
+                "PUT /v1/filter HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{put_body}",
+                put_body.len()
+            ),
+        )
+        .await;
+        assert_eq!(code, 200);
+
+        // GET it back.
+        let (code, body) = http(
+            addr,
+            "GET /v1/filter HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert!(
+            body.contains("\"deny\":\"*.doubleclick.net\""),
+            "got: {body}"
+        );
+        assert!(body.contains("\"allow\":\"cdn.ok.com\""), "got: {body}");
+
+        // The status page reflects the active filter (2 rules, blocklist).
+        let (_c, sbody) = http(
+            addr,
+            "GET /v1/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(sbody.contains("\"filtered_total\":0"), "got: {sbody}");
+        assert!(sbody.contains("\"active\":true"), "got: {sbody}");
+        assert!(sbody.contains("\"rules\":2"), "got: {sbody}");
+
+        // DELETE clears it.
+        let (code, body) = http(
+            addr,
+            "DELETE /v1/filter HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert!(body.contains("\"cleared\":true"), "got: {body}");
+
+        let (_c, body) = http(
+            addr,
+            "GET /v1/filter HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(body.contains("\"rules\":[]"), "got: {body}");
+    }
+
+    #[tokio::test]
+    async fn filter_rejects_rule_with_both_actions() {
+        let (addr, _dir) = test_server().await;
+        let bad = r#"{"rules":[{"deny":"x.com","allow":"x.com"}]}"#;
+        let (code, _b) = http(
+            addr,
+            &format!(
+                "PUT /v1/filter HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{bad}",
+                bad.len()
+            ),
+        )
+        .await;
+        assert_eq!(code, 400);
     }
 
     #[tokio::test]
@@ -1121,6 +1320,7 @@ mod tests {
             },
             upstreams,
             active_route: None,
+            filter: crate::filter::FilterRules::default(),
         };
         let (store, _rx) = ConfigStore::new(cold, dir.path().join("runic.snapshot.json"));
         let store = Arc::new(Mutex::new(store));

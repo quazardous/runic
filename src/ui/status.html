@@ -73,6 +73,7 @@
     <div class="card"><div class="k">Active route</div><div class="v" id="route">—</div></div>
     <div class="card"><div class="k">Active sessions</div><div class="v" id="sessions">—</div></div>
     <div class="card"><div class="k">Requests total</div><div class="v" id="requests">—</div></div>
+    <div class="card"><div class="k">Filtered</div><div class="v" id="filtered">—</div><div class="k" id="filter-mode"></div></div>
     <div class="card"><div class="k">Uptime</div><div class="v" id="uptime">—</div></div>
   </div>
 
@@ -124,6 +125,17 @@ function paint(d) {
     : '<span class="none">none</span>';
   el("sessions").textContent = d.active_sessions;
   el("requests").textContent = d.requests_total;
+  el("filtered").textContent = d.filtered_total != null ? d.filtered_total : "—";
+  // Show the filter posture under the counter: e.g. "blocklist · 12 rules",
+  // "allowlist · 3 rules", or "off" when nothing is configured.
+  var f = d.filter, fm = el("filter-mode");
+  if (f && f.active) {
+    var mode = f.default === "deny" ? "allowlist" : "blocklist";
+    fm.textContent = mode + " · " + f.rules + (f.rules === 1 ? " rule" : " rules") +
+      (f.enforce_in_silo ? " · silo floor" : "");
+  } else {
+    fm.textContent = "off";
+  }
   el("uptime").textContent = fmtDur(d.uptime_secs);
   el("leak").className = "banner" + (d.any_active_direct ? " warn" : "");
 

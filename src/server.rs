@@ -10,6 +10,7 @@ use tokio::sync::{watch, Mutex, Notify};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{Config, ListenAuth, Upstream, UpstreamKind};
+use crate::filter::{self, Action, FilterRules};
 use crate::silo::{VariationCache, VariationData};
 use crate::stats::Stats;
 use crate::upstream;
@@ -26,6 +27,9 @@ const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
 const REPLY_SUCCEEDED: u8 = 0x00;
 const REPLY_GENERAL_FAILURE: u8 = 0x01;
+/// SOCKS5 reply 0x02 — "connection not allowed by ruleset". The exact code for a
+/// target refused by policy; the domain filter returns it on a `deny`.
+const REPLY_CONN_NOT_ALLOWED: u8 = 0x02;
 const REPLY_CMD_NOT_SUPPORTED: u8 = 0x07;
 const REPLY_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
@@ -227,7 +231,8 @@ async fn serve(
     // Resolve the upstream for this session (owned). In silo mode the SOCKS5
     // password carries the silo token; on a `none`-mode dedicated port the
     // variation is fixed by id (no token); otherwise routing is by the username.
-    let (chosen_upstream, variation_id) =
+    // The optional third element is the session's silo filter (None off-silo).
+    let (chosen_upstream, variation_id, silo_filter) =
         match resolve_route(cfg, silo, creds.as_ref(), port_variation_id).await {
             Some(r) => r,
             None => {
@@ -244,6 +249,16 @@ async fn serve(
                 return Ok(());
             }
         };
+
+    // Domain filter — decide allow/deny on the target host BEFORE dialing the
+    // upstream (no bytes leave, no proxy quota spent on a blocked host). The
+    // global filter and, in silo mode, the variation's own filter compose here.
+    if filter::decide_session(&cfg.filter, silo_filter.as_ref(), &host, port) == Action::Deny {
+        stats.record_filtered(variation_id.as_deref());
+        warn!(%host, port, "CONNECT denied by domain filter");
+        reply(&mut client, REPLY_CONN_NOT_ALLOWED).await?;
+        return Ok(());
+    }
 
     // Live counters for the status surface: mark this session active for its
     // variation (if any) and flag it as a leak if the chosen upstream is
@@ -288,7 +303,7 @@ async fn resolve_route(
     silo: &Option<Arc<Mutex<VariationCache>>>,
     creds: Option<&UserPass>,
     port_variation_id: Option<&str>,
-) -> Option<(Upstream, Option<String>)> {
+) -> Option<(Upstream, Option<String>, Option<FilterRules>)> {
     let user = creds.map(|c| c.username.as_str());
 
     // `none`-mode dedicated port: the variation is fixed by id, served from the
@@ -296,14 +311,15 @@ async fn resolve_route(
     if let Some(id) = port_variation_id {
         let cache = silo.as_ref()?;
         let data = cache.lock().await.peek_warm(id, unix_now())?;
+        let filter = data.filter.clone();
         let up = pick_from_merged(cfg, data, user)?;
-        return Some((up, Some(id.to_string())));
+        return Some((up, Some(id.to_string()), Some(filter)));
     }
 
     match silo {
         None => crate::routing::pick_upstream(cfg, user)
             .cloned()
-            .map(|up| (up, None)),
+            .map(|up| (up, None, None)),
         Some(cache) => {
             // rfc1929: the SOCKS5 password is the silo token.
             let token = creds
@@ -311,8 +327,9 @@ async fn resolve_route(
                 .filter(|p| !p.is_empty())?;
             let id = VariationCache::id_of(token);
             let data = cache.lock().await.access(token, unix_now()).ok()?;
+            let filter = data.filter.clone();
             let up = pick_from_merged(cfg, data, user)?;
-            Some((up, id))
+            Some((up, id, Some(filter)))
         }
     }
 }
@@ -326,6 +343,7 @@ fn pick_from_merged(cfg: &Config, data: VariationData, user: Option<&str>) -> Op
         listen: cfg.listen.clone(),
         upstreams: pool,
         active_route: cfg.active_route.clone(),
+        filter: cfg.filter.clone(),
     };
     crate::routing::pick_upstream(&session, user).cloned()
 }
@@ -723,6 +741,7 @@ mod tests {
             },
             upstreams,
             active_route: None,
+            filter: crate::filter::FilterRules::default(),
         }
     }
 
@@ -755,6 +774,49 @@ mod tests {
         let payload = b"ping-through-tunnel";
         let echoed = echo_roundtrip(&mut tunnel, payload).await.unwrap();
         assert_eq!(echoed, payload);
+    }
+
+    #[tokio::test]
+    async fn e2e_filter_deny_refuses_connect_with_0x02() {
+        use crate::filter::{Action, FilterRules, Rule};
+
+        let upstream_addr = spawn_mock_upstream(MockBehavior::Echo, "u", "p").await;
+        let listen_addr = pick_free_port();
+        let mut cfg = cfg_for(listen_addr, upstream_addr, "u", "p");
+        // Blocklist the target host at the CONNECT layer.
+        cfg.filter = FilterRules {
+            default: Action::Allow,
+            rules: vec![Rule::Deny("blocked.example".into())],
+            enforce_in_silo: false,
+        };
+        let (_tx, rx) = watch::channel(Arc::new(cfg));
+
+        let stats = Stats::new();
+        let server_stats = stats.clone();
+        tokio::spawn(async move {
+            let _ = run(rx, None, server_stats).await;
+        });
+        wait_until_listening(listen_addr).await;
+
+        // Denied host → SOCKS5 reply 0x02 (connection not allowed by ruleset),
+        // and no session begins (filtered counter bumps, requests stays 0).
+        let code = socks5_connect_capture_code(listen_addr, "blocked.example", 443)
+            .await
+            .unwrap();
+        assert_eq!(code, 0x02, "blocked host must get reply 0x02");
+        let snap = stats.snapshot();
+        assert_eq!(snap.filtered_total, 1);
+        assert_eq!(
+            snap.requests_total, 0,
+            "a filtered CONNECT is not a session"
+        );
+
+        // A non-blocked host still connects (reply 0x00).
+        let code = socks5_connect_capture_code(listen_addr, "allowed.example", 443)
+            .await
+            .unwrap();
+        assert_eq!(code, 0x00, "non-blocked host should connect");
+        assert_eq!(stats.snapshot().requests_total, 1);
     }
 
     #[tokio::test]
@@ -863,6 +925,7 @@ mod tests {
             },
             upstreams,
             active_route: None,
+            filter: crate::filter::FilterRules::default(),
         }
     }
 
@@ -1007,7 +1070,14 @@ mod tests {
             },
         );
         cache
-            .write(&token, &VariationData { upstreams: ups }, 0)
+            .write(
+                &token,
+                &VariationData {
+                    upstreams: ups,
+                    ..Default::default()
+                },
+                0,
+            )
             .unwrap();
         let silo = Some(Arc::new(Mutex::new(cache)));
 
@@ -1020,6 +1090,7 @@ mod tests {
             },
             upstreams: BTreeMap::new(),
             active_route: None,
+            filter: crate::filter::FilterRules::default(),
         };
         let (_tx, rx) = watch::channel(Arc::new(cfg));
         tokio::spawn(async move {
@@ -1057,6 +1128,7 @@ mod tests {
             },
             upstreams: BTreeMap::new(),
             active_route: None,
+            filter: crate::filter::FilterRules::default(),
         };
         let (_tx, rx) = watch::channel(Arc::new(cfg));
         tokio::spawn(async move {
@@ -1104,8 +1176,15 @@ mod tests {
                     },
                 },
             );
-            c.write(&token, &VariationData { upstreams: ups }, 0)
-                .unwrap();
+            c.write(
+                &token,
+                &VariationData {
+                    upstreams: ups,
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap();
             c.access(&token, 0).unwrap(); // warm it
             VariationCache::id_of(&token).unwrap()
         };
@@ -1118,6 +1197,7 @@ mod tests {
             },
             upstreams: BTreeMap::new(),
             active_route: None,
+            filter: crate::filter::FilterRules::default(),
         };
         let (_tx, cfg_rx) = watch::channel(Arc::new(cfg));
         let ports = SiloPorts::new(cfg_rx, cache.clone(), Stats::new());

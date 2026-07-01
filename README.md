@@ -62,6 +62,11 @@ In:
   `kind: direct` upstream); set `RUNIC_ALLOW_DIRECT=0` to forbid it for hardening.
 - Switch the active default route by name, live, via the admin API
   (`PUT /v1/route/default`) — clients keep the same local port.
+- **Domain filtering at CONNECT** — ordered allow/deny rules on the target host
+  (firewalld-style, first-match-wins) refuse tunnels to whole domains (image
+  CDNs, ad/tracker hosts) without any TLS interception. One engine does both a
+  blocklist and a strict allowlist; in silo mode each client carries its own.
+  See [`docs/install/filtering.md`](docs/install/filtering.md).
 - **Encrypted, per-client config** (opt-in *silo* mode): each client holds its
   own off-box key; runic keeps only ciphertext + a one-way fingerprint on disk,
   so a seized box reveals nothing. Bind by token-in-password or a dedicated
@@ -90,6 +95,9 @@ Per-OS install guides live in [`docs/`](docs/README.md):
 - [`docs/install/admin-api.md`](docs/install/admin-api.md) — Admin API:
   change the upstream pool at runtime and persist with `?permanent=true`
   (firewalld-style runtime/permanent).
+- [`docs/install/filtering.md`](docs/install/filtering.md) — Domain filtering:
+  allow/deny the target host at CONNECT (bandwidth savings for scraping, ad/CDN
+  blocking) — no MITM.
 - [`docs/install/silo.md`](docs/install/silo.md) — Config silo: encrypted,
   per-client config whose keys never touch the box's disk (opt-in).
 
@@ -114,6 +122,12 @@ upstreams:                    # pool keyed by name; the routing layer picks per 
     auth:
       username_env: DATAIMPULSE_LOGIN
       password_env: DATAIMPULSE_PASSWORD
+
+filter:                       # optional; allow/deny the target host at CONNECT (no MITM)
+  default: allow              # allow → blocklist; deny → strict allowlist
+  rules:                      # ordered, first-match-wins (like a firewall chain)
+    - deny:  "*.doubleclick.net"
+    - allow: "cdn.mysite.com"
 ```
 
 Required env vars:
@@ -161,8 +175,10 @@ runic's design borrows from prior work, gratefully acknowledged:
   the runtime/permanent split, and the versioned round-trippable state dump.
 - [shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust) — idiomatic
   tokio service structure and lock-free config-sharing patterns.
-- [firewalld](https://firewalld.org/) — the runtime/permanent mental model the
-  admin API exposes (`?permanent=true`, runtime-to-permanent).
+- [firewalld](https://firewalld.org/) / [iptables](https://www.netfilter.org/) —
+  the runtime/permanent mental model the admin API exposes (`?permanent=true`,
+  runtime-to-permanent), and the ordered, first-match-wins rule model behind the
+  domain filter.
 
 ## Contributing
 

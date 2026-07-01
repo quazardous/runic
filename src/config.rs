@@ -6,6 +6,8 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::filter::FilterRules;
+
 pub const DEFAULT_UPSTREAM_NAME: &str = "default";
 
 #[derive(Debug, Clone)]
@@ -17,6 +19,11 @@ pub struct Config {
     /// back to the entry literally named `default`. This is a runtime pointer —
     /// switching the active provider by name, without re-sending its creds.
     pub active_route: Option<String>,
+    /// Instance-wide domain filter applied at CONNECT time (before dialing the
+    /// upstream). Empty = allow everything (the default). In silo mode each
+    /// variation carries its own filter; see [`crate::filter::decide_session`]
+    /// for how the two compose.
+    pub filter: FilterRules,
 }
 
 impl Config {
@@ -146,6 +153,9 @@ struct RawFile {
     upstreams: BTreeMap<String, UpstreamSpec>,
     #[serde(default)]
     silo: Option<SiloConfig>,
+    /// Instance-wide domain filter. Absent = allow everything.
+    #[serde(default)]
+    filter: FilterRules,
 }
 
 /// Wire shape of one upstream entry, shared by the cold YAML loader and the
@@ -290,6 +300,7 @@ impl Config {
                 // The active-route pointer is a runtime (admin-API) concept; the
                 // cold YAML doesn't set it. None = fall back to the `default` entry.
                 active_route: None,
+                filter: file.filter,
             },
             file.admin,
             file.silo,
@@ -492,6 +503,35 @@ silo:
         let s = silo2.unwrap();
         assert_eq!(s.ttl_days, 7);
         assert_eq!(s.auth, SiloAuth::Rfc1929);
+    }
+
+    #[test]
+    fn parses_filter_section() {
+        use crate::filter::{Action, Rule};
+        let yaml = r#"listen:
+  addr: "127.0.0.1:7777"
+upstreams: {}
+filter:
+  default: allow
+  enforce_in_silo: true
+  rules:
+    - deny: "*.doubleclick.net"
+    - allow: "cdn.mysite.com"
+"#;
+        let f = write_tmp(yaml);
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(cfg.filter.default, Action::Allow);
+        assert!(cfg.filter.enforce_in_silo);
+        assert_eq!(cfg.filter.rules.len(), 2);
+        assert_eq!(cfg.filter.rules[0], Rule::Deny("*.doubleclick.net".into()));
+        assert_eq!(cfg.filter.rules[1], Rule::Allow("cdn.mysite.com".into()));
+    }
+
+    #[test]
+    fn filter_absent_is_noop() {
+        let f = write_tmp("listen:\n  addr: \"127.0.0.1:7777\"\nupstreams: {}\n");
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(cfg.filter.is_noop());
     }
 
     #[test]

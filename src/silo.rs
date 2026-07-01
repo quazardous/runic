@@ -116,6 +116,12 @@ fn decode_token(s: &str) -> Result<Vec<u8>> {
 pub struct VariationData {
     #[serde(default)]
     pub upstreams: BTreeMap<String, Upstream>,
+    /// This variation's own domain filter (encrypted at rest with the rest of
+    /// the config). `#[serde(default)]` so blobs written before the filter
+    /// existed decrypt as "no filter". Composed with the global filter at
+    /// CONNECT time — see [`crate::filter::decide_session`].
+    #[serde(default)]
+    pub filter: crate::filter::FilterRules,
 }
 
 /// Public, token-free metadata about one variation on disk — what the status
@@ -575,7 +581,10 @@ mod tests {
                 },
             },
         );
-        VariationData { upstreams }
+        VariationData {
+            upstreams,
+            ..Default::default()
+        }
     }
 
     fn all_silo_bytes(dir: &Path) -> Vec<u8> {

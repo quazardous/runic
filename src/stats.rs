@@ -19,6 +19,8 @@ struct Inner {
     /// Active sessions whose chosen upstream is `kind: direct` (local IP exposed).
     active_direct: u64,
     requests_total: u64,
+    /// Cumulative CONNECTs refused by the domain filter (never begins a session).
+    filtered_total: u64,
     per_variation: HashMap<String, VarCounters>,
 }
 
@@ -26,6 +28,7 @@ struct Inner {
 struct VarCounters {
     active: u64,
     requests: u64,
+    filtered: u64,
 }
 
 /// Process-wide live session stats. Cloneable handle via `Arc`.
@@ -39,6 +42,7 @@ pub struct Stats {
 pub struct VarStat {
     pub active: u64,
     pub requests: u64,
+    pub filtered: u64,
 }
 
 /// A point-in-time copy of the counters, for the status endpoint to read without
@@ -47,6 +51,7 @@ pub struct StatsSnapshot {
     pub active_total: u64,
     pub active_direct: u64,
     pub requests_total: u64,
+    pub filtered_total: u64,
     per_variation: HashMap<String, VarStat>,
 }
 
@@ -94,12 +99,24 @@ impl Stats {
         }
     }
 
+    /// Record a CONNECT refused by the domain filter. Bumps the cumulative
+    /// counter (and the per-variation one when the session was bound to a silo
+    /// variation). No session begins, so there is no active gauge to touch.
+    pub fn record_filtered(self: &Arc<Self>, variation: Option<&str>) {
+        let mut g = self.inner.lock().expect("stats lock");
+        g.filtered_total += 1;
+        if let Some(id) = variation {
+            g.per_variation.entry(id.to_string()).or_default().filtered += 1;
+        }
+    }
+
     pub fn snapshot(&self) -> StatsSnapshot {
         let g = self.inner.lock().expect("stats lock");
         StatsSnapshot {
             active_total: g.active_total,
             active_direct: g.active_direct,
             requests_total: g.requests_total,
+            filtered_total: g.filtered_total,
             per_variation: g
                 .per_variation
                 .iter()
@@ -109,6 +126,7 @@ impl Stats {
                         VarStat {
                             active: v.active,
                             requests: v.requests,
+                            filtered: v.filtered,
                         },
                     )
                 })

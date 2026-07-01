@@ -112,6 +112,7 @@ mod tests {
             },
             upstreams,
             active_route: None,
+            filter: crate::filter::FilterRules::default(),
         }
     }
 
@@ -166,6 +167,7 @@ mod tests {
             },
             upstreams,
             active_route: None,
+            filter: crate::filter::FilterRules::default(),
         }
     }
 
