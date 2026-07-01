@@ -11,6 +11,8 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-01
+
 ### Added
 
 - **Domain filtering at the CONNECT layer.** runic can now allow or deny a
