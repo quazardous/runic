@@ -106,12 +106,6 @@ pub struct FilterRules {
     /// Ordered rules; the first whose pattern matches the target decides.
     #[serde(default)]
     pub rules: Vec<Rule>,
-    /// **Global-only** knob: when true, a global `deny` is a hard floor even
-    /// inside a silo — a silo may tighten (deny more) but never re-allow a
-    /// globally-denied host. Default `false` = silo-sovereign. Ignored on a
-    /// per-silo ruleset (a silo cannot impose a floor on itself).
-    #[serde(default)]
-    pub enforce_in_silo: bool,
 }
 
 impl FilterRules {
@@ -133,36 +127,45 @@ impl FilterRules {
     }
 }
 
-/// Compose the global and (optional) per-silo filters for one session.
+/// Decide allow/deny for one session, composing the instance and (optional)
+/// per-silo filters.
 ///
-/// - **Non-silo session** → the global filter decides.
-/// - **Silo session** (a variation resolved for this session):
-///   1. if the global filter has `enforce_in_silo` set **and** it denies the
-///      host, the CONNECT is denied — the operator's hard floor is inviolable;
-///   2. otherwise the silo is **sovereign**: a variation that defines its own
-///      filter governs its sessions entirely; one that defines none inherits the
-///      global filter as a baseline (so an operator's rules still protect silo
-///      clients that set nothing, rather than silently allowing everything).
+/// - **Non-silo session** → the `instance` filter decides (its rules, then its
+///   default). This is the merged instance filter (file plus any admin-API
+///   runtime/permanent overrides).
+/// - **Silo session** → the silo's own rules compose **on top of** the static
+///   file `floor` (the cold-YAML global), which is the *only* thing that floors
+///   a silo. The admin-API runtime/permanent layers deliberately never reach a
+///   silo — a filter mutation without the client's token must not pierce silo
+///   isolation. Evaluation:
+///   1. the silo's own rules, first-match — they add to / override the floor;
+///   2. a silo that declares `default: deny` is a **closed allowlist** — anything
+///      its own rules didn't allow is denied, and the floor cannot loosen it;
+///   3. otherwise (the additive case) fall through to the file `floor` (its
+///      rules, then its default). A silo that sets no filter of its own is
+///      therefore governed entirely by the file floor.
 pub fn decide_session(
-    global: &FilterRules,
+    instance: &FilterRules,
     silo: Option<&FilterRules>,
+    floor: &FilterRules,
     host: &str,
     port: u16,
 ) -> Action {
     let Some(silo) = silo else {
-        return global.decide(host, port);
+        return instance.decide(host, port);
     };
-    // (1) Operator hard floor (opt-in): a global deny is inviolable in-silo.
-    if global.enforce_in_silo && global.decide(host, port) == Action::Deny {
+    // (1) The silo's own rules win where they match — additive on top of the floor.
+    for rule in &silo.rules {
+        if host_matches(rule.pattern(), host, port) {
+            return rule.action();
+        }
+    }
+    // (2) A silo that opted into allowlist mode is closed; the floor can't reopen it.
+    if silo.default == Action::Deny {
         return Action::Deny;
     }
-    // (2) Silo-sovereign, with the global filter as a baseline for silos that
-    //     declare no filter of their own.
-    if silo.is_noop() {
-        global.decide(host, port)
-    } else {
-        silo.decide(host, port)
-    }
+    // (3) Additive silo → the static file floor governs the rest.
+    floor.decide(host, port)
 }
 
 /// Does `pattern` match the target `host:port`?
@@ -270,13 +273,16 @@ mod tests {
 
     // --- decide (single ruleset) ---------------------------------------------
 
+    fn rules(default: Action, rules: Vec<Rule>) -> FilterRules {
+        FilterRules { default, rules }
+    }
+
     #[test]
     fn blocklist_denies_listed_allows_rest() {
-        let f = FilterRules {
-            default: Action::Allow,
-            rules: vec![deny("*.doubleclick.net"), deny("google-analytics.com")],
-            enforce_in_silo: false,
-        };
+        let f = rules(
+            Action::Allow,
+            vec![deny("*.doubleclick.net"), deny("google-analytics.com")],
+        );
         assert_eq!(f.decide("ads.doubleclick.net", 443), Action::Deny);
         assert_eq!(f.decide("google-analytics.com", 443), Action::Deny);
         assert_eq!(f.decide("example.com", 443), Action::Allow);
@@ -284,11 +290,10 @@ mod tests {
 
     #[test]
     fn allowlist_mode_denies_unlisted() {
-        let f = FilterRules {
-            default: Action::Deny,
-            rules: vec![allow("api.target.com"), allow("*.target.com")],
-            enforce_in_silo: false,
-        };
+        let f = rules(
+            Action::Deny,
+            vec![allow("api.target.com"), allow("*.target.com")],
+        );
         assert_eq!(f.decide("api.target.com", 443), Action::Allow);
         assert_eq!(f.decide("cdn.target.com", 443), Action::Allow);
         assert_eq!(f.decide("evil.example", 443), Action::Deny);
@@ -296,11 +301,10 @@ mod tests {
 
     #[test]
     fn first_match_wins_allow_exception_before_broad_deny() {
-        let f = FilterRules {
-            default: Action::Allow,
-            rules: vec![allow("cdn.mysite.com"), deny("*.mysite.com")],
-            enforce_in_silo: false,
-        };
+        let f = rules(
+            Action::Allow,
+            vec![allow("cdn.mysite.com"), deny("*.mysite.com")],
+        );
         // the allow is listed first, so it wins for that host
         assert_eq!(f.decide("cdn.mysite.com", 443), Action::Allow);
         // any other subdomain still hits the broad deny
@@ -323,84 +327,111 @@ mod tests {
         assert!(!f.is_noop());
     }
 
-    // --- decide_session (global ∘ silo composition) --------------------------
+    // --- decide_session (instance / silo ∘ file-floor composition) -----------
 
     #[test]
-    fn non_silo_uses_global() {
-        let global = FilterRules {
-            default: Action::Allow,
-            rules: vec![deny("bad.example")],
-            enforce_in_silo: false,
-        };
+    fn non_silo_uses_instance_filter() {
+        let instance = rules(Action::Allow, vec![deny("bad.example")]);
+        let floor = FilterRules::default();
         assert_eq!(
-            decide_session(&global, None, "bad.example", 443),
+            decide_session(&instance, None, &floor, "bad.example", 443),
             Action::Deny
         );
         assert_eq!(
-            decide_session(&global, None, "ok.example", 443),
+            decide_session(&instance, None, &floor, "ok.example", 443),
             Action::Allow
         );
     }
 
     #[test]
-    fn silo_sovereign_ignores_global_when_it_has_its_own() {
-        let global = FilterRules {
-            default: Action::Allow,
-            rules: vec![deny("blocked-by-op.example")],
-            enforce_in_silo: false, // not a hard floor
-        };
-        let silo = FilterRules {
-            default: Action::Allow,
-            rules: vec![deny("blocked-by-client.example")],
-            enforce_in_silo: false,
-        };
-        // global's deny does NOT apply to a sovereign silo session
+    fn silo_rules_compose_on_top_of_file_floor() {
+        // File floor blocks a shared tracker for everyone.
+        let floor = rules(Action::Allow, vec![deny("tracker.shared")]);
+        // The silo adds its own module-specific deny.
+        let silo = rules(Action::Allow, vec![deny("module.specific")]);
+        // instance filter is irrelevant to a silo session (never consulted).
+        let instance = rules(Action::Allow, vec![deny("via-noBearer-api.example")]);
+
+        // the silo's own deny applies
         assert_eq!(
-            decide_session(&global, Some(&silo), "blocked-by-op.example", 443),
+            decide_session(&instance, Some(&silo), &floor, "module.specific", 443),
+            Action::Deny
+        );
+        // the file floor still applies where the silo is silent (compose, not replace)
+        assert_eq!(
+            decide_session(&instance, Some(&silo), &floor, "tracker.shared", 443),
+            Action::Deny
+        );
+        // a host neither blocks → allowed
+        assert_eq!(
+            decide_session(&instance, Some(&silo), &floor, "fine.example", 443),
             Action::Allow
         );
-        // the silo's own deny does
+        // the API-mutable instance layer never reaches a silo session
         assert_eq!(
-            decide_session(&global, Some(&silo), "blocked-by-client.example", 443),
-            Action::Deny
+            decide_session(
+                &instance,
+                Some(&silo),
+                &floor,
+                "via-noBearer-api.example",
+                443
+            ),
+            Action::Allow
         );
     }
 
     #[test]
-    fn silo_without_own_filter_inherits_global_baseline() {
-        let global = FilterRules {
-            default: Action::Allow,
-            rules: vec![deny("bad.example")],
-            enforce_in_silo: false,
-        };
+    fn silo_with_no_filter_is_governed_by_the_file_floor() {
+        let floor = rules(Action::Allow, vec![deny("bad.example")]);
         let empty = FilterRules::default();
+        let instance = FilterRules::default();
         assert_eq!(
-            decide_session(&global, Some(&empty), "bad.example", 443),
+            decide_session(&instance, Some(&empty), &floor, "bad.example", 443),
+            Action::Deny
+        );
+        assert_eq!(
+            decide_session(&instance, Some(&empty), &floor, "ok.example", 443),
+            Action::Allow
+        );
+    }
+
+    #[test]
+    fn silo_allow_overrides_a_floor_deny() {
+        // Overridable floor (the default): a silo may re-allow what the floor denies.
+        let floor = rules(Action::Allow, vec![deny("*.cdn.example")]);
+        let silo = rules(Action::Allow, vec![allow("img.cdn.example")]);
+        let instance = FilterRules::default();
+        // the silo's allow wins (evaluated first)
+        assert_eq!(
+            decide_session(&instance, Some(&silo), &floor, "img.cdn.example", 443),
+            Action::Allow
+        );
+        // a sibling the silo didn't re-allow still hits the floor deny
+        assert_eq!(
+            decide_session(&instance, Some(&silo), &floor, "js.cdn.example", 443),
             Action::Deny
         );
     }
 
     #[test]
-    fn enforce_in_silo_makes_global_deny_a_hard_floor() {
-        let global = FilterRules {
-            default: Action::Allow,
-            rules: vec![deny("blocked-by-op.example")],
-            enforce_in_silo: true, // hard floor
-        };
-        // silo tries to allow everything, but the global deny is inviolable
-        let silo = FilterRules {
-            default: Action::Allow,
-            rules: vec![allow("blocked-by-op.example")],
-            enforce_in_silo: false,
-        };
+    fn silo_default_deny_is_a_closed_allowlist_floor_cannot_reopen() {
+        // A silo that declares `default: deny` is a strict allowlist: anything
+        // its own rules didn't allow is denied, regardless of the floor.
+        let floor = rules(Action::Allow, vec![allow("floor-allows.example")]);
+        let silo = rules(Action::Deny, vec![allow("api.target")]);
+        let instance = FilterRules::default();
         assert_eq!(
-            decide_session(&global, Some(&silo), "blocked-by-op.example", 443),
+            decide_session(&instance, Some(&silo), &floor, "api.target", 443),
+            Action::Allow
+        );
+        // floor's allow does NOT leak into a closed-allowlist silo
+        assert_eq!(
+            decide_session(&instance, Some(&silo), &floor, "floor-allows.example", 443),
             Action::Deny
         );
-        // hosts the global doesn't block still follow the silo
         assert_eq!(
-            decide_session(&global, Some(&silo), "elsewhere.example", 443),
-            Action::Allow
+            decide_session(&instance, Some(&silo), &floor, "anything.else", 443),
+            Action::Deny
         );
     }
 
@@ -413,11 +444,9 @@ default: allow
 rules:
   - deny: "*.doubleclick.net"
   - allow: "cdn.mysite.com"
-enforce_in_silo: true
 "#;
         let f: FilterRules = serde_yaml::from_str(y).unwrap();
         assert_eq!(f.default, Action::Allow);
-        assert!(f.enforce_in_silo);
         assert_eq!(f.rules.len(), 2);
         assert_eq!(f.rules[0], deny("*.doubleclick.net"));
         assert_eq!(f.rules[1], allow("cdn.mysite.com"));
@@ -427,6 +456,13 @@ enforce_in_silo: true
     fn absent_fields_default() {
         let f: FilterRules = serde_yaml::from_str("{}").unwrap();
         assert!(f.is_noop());
-        assert!(!f.enforce_in_silo);
+    }
+
+    #[test]
+    fn legacy_enforce_in_silo_key_is_ignored_not_rejected() {
+        // Old configs/snapshots may still carry the retired field; it must load,
+        // not fail (FilterRules doesn't deny unknown fields).
+        let f: FilterRules = serde_yaml::from_str("enforce_in_silo: true\n").unwrap();
+        assert!(f.is_noop());
     }
 }

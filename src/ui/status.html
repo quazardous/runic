@@ -127,12 +127,17 @@ function paint(d) {
   el("requests").textContent = d.requests_total;
   el("filtered").textContent = d.filtered_total != null ? d.filtered_total : "—";
   // Show the filter posture under the counter: e.g. "blocklist · 12 rules",
-  // "allowlist · 3 rules", or "off" when nothing is configured.
+  // "allowlist · 3 rules", or "off" when nothing is configured. A file-level
+  // silo floor (composed under every silo's own filter) is noted when present.
   var f = d.filter, fm = el("filter-mode");
-  if (f && f.active) {
-    var mode = f.default === "deny" ? "allowlist" : "blocklist";
-    fm.textContent = mode + " · " + f.rules + (f.rules === 1 ? " rule" : " rules") +
-      (f.enforce_in_silo ? " · silo floor" : "");
+  if (f && (f.active || f.silo_floor_rules)) {
+    var parts = [];
+    if (f.active) {
+      var mode = f.default === "deny" ? "allowlist" : "blocklist";
+      parts.push(mode + " · " + f.rules + (f.rules === 1 ? " rule" : " rules"));
+    }
+    if (f.silo_floor_rules) parts.push("silo floor · " + f.silo_floor_rules);
+    fm.textContent = parts.join(" · ");
   } else {
     fm.textContent = "off";
   }

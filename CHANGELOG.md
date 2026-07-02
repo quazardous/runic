@@ -11,6 +11,27 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-02
+
+### Changed
+
+- **Silo domain filters now compose on top of a static file floor, and the
+  filter API surface is strictly per-silo.** The `filter:` block in the config
+  file acts as a baseline that every silo composes over: a silo's own rules are
+  evaluated first, then fall through to the file floor (a silo can add or
+  override, instead of the previous "silo replaces the global entirely"). Only
+  the **static file** filter floors a silo — the admin-API runtime/permanent
+  filter (`PUT /v1/filter` *without* a `Bearer` token) now governs **non-silo
+  sessions only** and can no longer affect any silo. This closes a
+  compartmentalization gap: a filter change pushed without a client's token must
+  not pierce silo isolation, and a declarative file baseline (immutable at
+  runtime) doesn't have that risk. A silo still sets its **own** filter with
+  `PUT /v1/filter` + `Bearer`, stored in its encrypted blob. The retired
+  `enforce_in_silo` flag is superseded by this (its hard-floor job is now the
+  safe, file-sourced floor); old configs carrying it load fine (the key is
+  ignored). `GET /v1/status` swaps the `filter.enforce_in_silo` field for
+  `filter.silo_floor_rules`. See [`docs/install/filtering.md`](docs/install/filtering.md).
+
 ## [0.4.0] - 2026-07-01
 
 ### Added

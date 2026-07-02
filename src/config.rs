@@ -20,10 +20,16 @@ pub struct Config {
     /// switching the active provider by name, without re-sending its creds.
     pub active_route: Option<String>,
     /// Instance-wide domain filter applied at CONNECT time (before dialing the
-    /// upstream). Empty = allow everything (the default). In silo mode each
-    /// variation carries its own filter; see [`crate::filter::decide_session`]
-    /// for how the two compose.
+    /// upstream) to **non-silo** sessions. This is the *merged* filter: the cold
+    /// YAML plus any admin-API runtime/permanent overrides. Empty = allow
+    /// everything (the default).
     pub filter: FilterRules,
+    /// The **static file** (cold-YAML) filter, kept separate from `filter` so it
+    /// can serve as the floor a silo session composes on top of. Only the
+    /// declarative file layer floors silos — the admin-API runtime/permanent
+    /// layers deliberately never reach a silo (a token-less mutation must not
+    /// pierce silo isolation). See [`crate::filter::decide_session`].
+    pub silo_floor_filter: FilterRules,
 }
 
 impl Config {
@@ -300,7 +306,11 @@ impl Config {
                 // The active-route pointer is a runtime (admin-API) concept; the
                 // cold YAML doesn't set it. None = fall back to the `default` entry.
                 active_route: None,
-                filter: file.filter,
+                // For a bare cold config both are the file filter; the store
+                // overlays runtime/permanent onto `filter` only, keeping
+                // `silo_floor_filter` pinned to the file layer.
+                filter: file.filter.clone(),
+                silo_floor_filter: file.filter,
             },
             file.admin,
             file.silo,
@@ -513,7 +523,6 @@ silo:
 upstreams: {}
 filter:
   default: allow
-  enforce_in_silo: true
   rules:
     - deny: "*.doubleclick.net"
     - allow: "cdn.mysite.com"
@@ -521,10 +530,11 @@ filter:
         let f = write_tmp(yaml);
         let cfg = Config::load(f.path()).unwrap();
         assert_eq!(cfg.filter.default, Action::Allow);
-        assert!(cfg.filter.enforce_in_silo);
         assert_eq!(cfg.filter.rules.len(), 2);
         assert_eq!(cfg.filter.rules[0], Rule::Deny("*.doubleclick.net".into()));
         assert_eq!(cfg.filter.rules[1], Rule::Allow("cdn.mysite.com".into()));
+        // The file filter is also the silo floor (verbatim).
+        assert_eq!(cfg.silo_floor_filter, cfg.filter);
     }
 
     #[test]

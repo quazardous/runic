@@ -251,9 +251,18 @@ async fn serve(
         };
 
     // Domain filter — decide allow/deny on the target host BEFORE dialing the
-    // upstream (no bytes leave, no proxy quota spent on a blocked host). The
-    // global filter and, in silo mode, the variation's own filter compose here.
-    if filter::decide_session(&cfg.filter, silo_filter.as_ref(), &host, port) == Action::Deny {
+    // upstream (no bytes leave, no proxy quota spent on a blocked host). A
+    // non-silo session obeys the merged instance filter; a silo session composes
+    // its own filter on top of the static file floor (`cfg.silo_floor_filter`) —
+    // the admin-API runtime/permanent layers never reach a silo.
+    if filter::decide_session(
+        &cfg.filter,
+        silo_filter.as_ref(),
+        &cfg.silo_floor_filter,
+        &host,
+        port,
+    ) == Action::Deny
+    {
         stats.record_filtered(variation_id.as_deref());
         warn!(%host, port, "CONNECT denied by domain filter");
         reply(&mut client, REPLY_CONN_NOT_ALLOWED).await?;
@@ -344,6 +353,7 @@ fn pick_from_merged(cfg: &Config, data: VariationData, user: Option<&str>) -> Op
         upstreams: pool,
         active_route: cfg.active_route.clone(),
         filter: cfg.filter.clone(),
+        silo_floor_filter: cfg.silo_floor_filter.clone(),
     };
     crate::routing::pick_upstream(&session, user).cloned()
 }
@@ -742,6 +752,7 @@ mod tests {
             upstreams,
             active_route: None,
             filter: crate::filter::FilterRules::default(),
+            silo_floor_filter: crate::filter::FilterRules::default(),
         }
     }
 
@@ -783,11 +794,11 @@ mod tests {
         let upstream_addr = spawn_mock_upstream(MockBehavior::Echo, "u", "p").await;
         let listen_addr = pick_free_port();
         let mut cfg = cfg_for(listen_addr, upstream_addr, "u", "p");
-        // Blocklist the target host at the CONNECT layer.
+        // Blocklist the target host at the CONNECT layer (non-silo session →
+        // the merged instance filter governs).
         cfg.filter = FilterRules {
             default: Action::Allow,
             rules: vec![Rule::Deny("blocked.example".into())],
-            enforce_in_silo: false,
         };
         let (_tx, rx) = watch::channel(Arc::new(cfg));
 
@@ -926,6 +937,7 @@ mod tests {
             upstreams,
             active_route: None,
             filter: crate::filter::FilterRules::default(),
+            silo_floor_filter: crate::filter::FilterRules::default(),
         }
     }
 
@@ -1091,6 +1103,7 @@ mod tests {
             upstreams: BTreeMap::new(),
             active_route: None,
             filter: crate::filter::FilterRules::default(),
+            silo_floor_filter: crate::filter::FilterRules::default(),
         };
         let (_tx, rx) = watch::channel(Arc::new(cfg));
         tokio::spawn(async move {
@@ -1113,6 +1126,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn e2e_silo_filter_composes_over_file_floor_ignores_instance() {
+        use crate::filter::{Action, FilterRules, Rule};
+        use crate::silo::{SiloStore, VariationCache, VariationData};
+
+        let upstream_addr = spawn_mock_upstream(MockBehavior::Echo, "alice", "s3cret").await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = VariationCache::new(
+            SiloStore::open(dir.path().join("runic.silo"), 3600).unwrap(),
+            3600,
+        );
+        let token = cache.create(0).unwrap();
+        let mut ups = BTreeMap::new();
+        ups.insert(
+            "default".to_string(),
+            Upstream {
+                kind: UpstreamKind::HttpConnect,
+                host: upstream_addr.ip().to_string(),
+                port: upstream_addr.port(),
+                auth: UpstreamCreds {
+                    username: "alice".into(),
+                    password: "s3cret".into(),
+                },
+            },
+        );
+        // The variation carries its OWN filter (its module-specific deny).
+        cache
+            .write(
+                &token,
+                &VariationData {
+                    upstreams: ups,
+                    filter: FilterRules {
+                        default: Action::Allow,
+                        rules: vec![Rule::Deny("silo-blocked.example".into())],
+                    },
+                },
+                0,
+            )
+            .unwrap();
+        let silo = Some(Arc::new(Mutex::new(cache)));
+
+        let listen_addr = pick_free_port();
+        let cfg = Config {
+            listen: Listen {
+                addr: listen_addr,
+                auth: ListenAuth::None,
+            },
+            upstreams: BTreeMap::new(),
+            active_route: None,
+            // The merged instance filter (as if set via no-Bearer API) blocks a
+            // host — it must NOT affect a silo session.
+            filter: FilterRules {
+                default: Action::Allow,
+                rules: vec![Rule::Deny("instance-only.example".into())],
+            },
+            // The static file floor blocks a host — it MUST compose under the silo.
+            silo_floor_filter: FilterRules {
+                default: Action::Allow,
+                rules: vec![Rule::Deny("floor-blocked.example".into())],
+            },
+        };
+        let (_tx, rx) = watch::channel(Arc::new(cfg));
+        tokio::spawn(async move {
+            let _ = run(rx, silo, Stats::new()).await;
+        });
+        wait_until_listening(listen_addr).await;
+
+        let connect = |host: &'static str| {
+            let t = token.clone();
+            async move {
+                crate::test_helpers::socks5_connect_with_userpass(listen_addr, "", &t, host, 443)
+                    .await
+            }
+        };
+
+        // (1) the silo's own deny applies.
+        let e = connect("silo-blocked.example").await.unwrap_err();
+        assert!(e.to_string().contains("0x02"), "silo deny → 0x02, got: {e}");
+        // (2) the file floor composes under the silo → also denied.
+        let e = connect("floor-blocked.example").await.unwrap_err();
+        assert!(
+            e.to_string().contains("0x02"),
+            "floor deny → 0x02, got: {e}"
+        );
+        // (3) the merged instance filter does NOT reach the silo → allowed.
+        connect("instance-only.example")
+            .await
+            .expect("instance (no-Bearer) filter must not touch a silo session");
+        // (4) a host nobody blocks → allowed.
+        connect("fine.example")
+            .await
+            .expect("unblocked host allowed");
+    }
+
+    #[tokio::test]
     async fn e2e_silo_unknown_token_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let cache = crate::silo::VariationCache::new(
@@ -1129,6 +1236,7 @@ mod tests {
             upstreams: BTreeMap::new(),
             active_route: None,
             filter: crate::filter::FilterRules::default(),
+            silo_floor_filter: crate::filter::FilterRules::default(),
         };
         let (_tx, rx) = watch::channel(Arc::new(cfg));
         tokio::spawn(async move {
@@ -1198,6 +1306,7 @@ mod tests {
             upstreams: BTreeMap::new(),
             active_route: None,
             filter: crate::filter::FilterRules::default(),
+            silo_floor_filter: crate::filter::FilterRules::default(),
         };
         let (_tx, cfg_rx) = watch::channel(Arc::new(cfg));
         let ports = SiloPorts::new(cfg_rx, cache.clone(), Stats::new());

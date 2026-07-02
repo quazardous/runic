@@ -575,12 +575,14 @@ async fn status_response(
 
     // Compact view of the effective global filter (the full ruleset is at
     // `GET /v1/filter`). `active` = at least one rule or a non-allow default.
+    // The instance filter (non-silo sessions); `silo_floor` is the static file
+    // baseline each silo composes on top of.
     let filter = &merged.filter;
     let filter_json = json!({
         "active": !filter.is_noop(),
         "default": filter.default,
         "rules": filter.rules.len(),
-        "enforce_in_silo": filter.enforce_in_silo,
+        "silo_floor_rules": merged.silo_floor_filter.rules.len(),
     });
 
     let upstreams_hot: Vec<_> = hot
@@ -688,6 +690,7 @@ fn variation_route(merged: &Config, data: &VariationData) -> Option<(String, Ups
         upstreams: pool,
         active_route: merged.active_route.clone(),
         filter: merged.filter.clone(),
+        silo_floor_filter: merged.silo_floor_filter.clone(),
     };
     route_named(&cfg)
 }
@@ -818,6 +821,7 @@ mod tests {
             upstreams,
             active_route: None,
             filter: crate::filter::FilterRules::default(),
+            silo_floor_filter: crate::filter::FilterRules::default(),
         };
         let (store, _rx) = ConfigStore::new(cold, dir.path().join("runic.snapshot.json"));
         let store = Arc::new(Mutex::new(store));
@@ -850,6 +854,7 @@ mod tests {
             upstreams: BTreeMap::new(),
             active_route: None,
             filter: crate::filter::FilterRules::default(),
+            silo_floor_filter: crate::filter::FilterRules::default(),
         };
         let (store, cfg_rx) = ConfigStore::new(cold, dir.path().join("runic.snapshot.json"));
         let store = Arc::new(Mutex::new(store));
@@ -1321,6 +1326,7 @@ mod tests {
             upstreams,
             active_route: None,
             filter: crate::filter::FilterRules::default(),
+            silo_floor_filter: crate::filter::FilterRules::default(),
         };
         let (store, _rx) = ConfigStore::new(cold, dir.path().join("runic.snapshot.json"));
         let store = Arc::new(Mutex::new(store));

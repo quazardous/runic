@@ -112,23 +112,40 @@ curl -s -X PUT http://127.0.0.1:48484/v1/filter \
   -d '{"default":"allow","rules":[{"deny":"*.ads.example"}]}'
 ```
 
-**How the global and per-silo filters compose** (see `filter::decide_session`):
+**How the filters compose** (see `filter::decide_session`):
 
-- A **non-silo** session obeys the global filter.
-- A **silo** session is **sovereign**: if the variation defines its own filter,
-  *only* that filter governs its sessions. If it defines none, it inherits the
-  global filter as a baseline (so an operator's rules still protect silo clients
-  who set nothing — no silent allow-all).
-- Set **`enforce_in_silo: true`** on the *global* filter to make a global `deny`
-  a **hard floor**: it applies even inside a silo, and a client may tighten (deny
-  more) but never re-allow a globally-denied host. Off by default (silos are
-  sovereign); turn it on when the box operator needs an un-bypassable block.
+- A **non-silo** session obeys the instance filter (the file `filter:` plus any
+  admin-API runtime/permanent overrides).
+- A **silo** session composes its own rules **on top of a static file floor**:
+  1. the silo's own rules, first-match — they add to / override the floor;
+  2. a silo that declares `default: deny` is a **closed allowlist** (its own
+     allows only; the floor cannot re-open it);
+  3. otherwise it falls through to the file floor — the `filter:` block of the
+     cold YAML — then that floor's `default`. A silo that sets no filter of its
+     own is governed entirely by the file floor.
+
+Only the **static file** `filter:` floors a silo. This is deliberate: the
+admin-API filter surface that floors silos must be **declarative and immutable at
+runtime**, so a filter change pushed *without* a client's `Bearer` token can
+never pierce silo isolation. Concretely:
+
+- **`PUT /v1/filter` with a `Bearer`** → writes that silo's own filter (encrypted
+  blob). Per-client, sovereign.
+- **`PUT /v1/filter` without a `Bearer`** → the instance filter for **non-silo**
+  sessions only. It does **not** reach any silo (no token-less cross-silo lever).
+- The **file floor** is set in the deployed `filter:` YAML — visible, auditable,
+  changed only by redeploy/hot-reload, never by a live API call.
 
 ```yaml
-# Global config: an operator floor that no silo can override.
+# The file floor: a baseline every silo composes on top of (each silo adds/
+# overrides its own rules; a silo can re-allow a floor-denied host unless it
+# runs its own strict allowlist).
 filter:
   default: allow
-  enforce_in_silo: true
   rules:
-    - deny: "*.internal.corp"
+    - deny: "*.doubleclick.net"
+    - deny: "*.ads.example"
 ```
+
+The status page shows the floor as `silo floor · N` alongside the instance
+filter posture; `GET /v1/status` carries `filter.silo_floor_rules`.

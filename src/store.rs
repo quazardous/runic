@@ -399,6 +399,7 @@ fn merge(
         upstreams.insert(k.clone(), v.clone());
     }
     // Filter precedence mirrors the upstream layers: hot ▷ snapshot ▷ cold.
+    // This merged filter governs NON-silo sessions only.
     let filter = filter_hot
         .clone()
         .or_else(|| filter_snapshot.clone())
@@ -408,6 +409,9 @@ fn merge(
         upstreams,
         active_route: active_route.clone(),
         filter,
+        // The silo floor is the cold (file) filter ONLY — the runtime/permanent
+        // admin-API overrides never floor a silo (token-less isolation).
+        silo_floor_filter: cold.silo_floor_filter.clone(),
     }
 }
 
@@ -514,6 +518,7 @@ mod tests {
             upstreams,
             active_route: None,
             filter: FilterRules::default(),
+            silo_floor_filter: FilterRules::default(),
         }
     }
 
@@ -566,24 +571,26 @@ mod tests {
         store.set_filter_runtime(FilterRules {
             default: Action::Allow,
             rules: vec![Rule::Deny("runtime.example".into())],
-            enforce_in_silo: false,
         });
         assert_eq!(store.merged().filter.rules.len(), 1);
+        // The runtime override governs the merged (non-silo) filter, but NOT the
+        // silo floor — that stays pinned to the cold (empty) file filter.
+        assert!(store.merged().silo_floor_filter.is_noop());
 
         // Permanent override — clears the runtime one and hits disk.
         store
             .set_filter_permanent(FilterRules {
                 default: Action::Deny,
                 rules: vec![Rule::Allow("api.example".into())],
-                enforce_in_silo: true,
             })
             .unwrap();
 
         let (reloaded, _rx2) = store_with(cold_with(&[("default", "cold.example")]), &dir);
         let f = reloaded.effective_filter();
         assert_eq!(f.default, Action::Deny);
-        assert!(f.enforce_in_silo);
         assert_eq!(f.rules, vec![Rule::Allow("api.example".into())]);
+        // Permanent override still doesn't leak into the silo floor.
+        assert!(reloaded.merged().silo_floor_filter.is_noop());
 
         // Clearing the permanent override falls back to the cold (empty) filter.
         let (mut reloaded2, _rx3) = store_with(cold_with(&[("default", "cold.example")]), &dir);

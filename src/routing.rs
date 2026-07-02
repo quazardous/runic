@@ -113,6 +113,7 @@ mod tests {
             upstreams,
             active_route: None,
             filter: crate::filter::FilterRules::default(),
+            silo_floor_filter: crate::filter::FilterRules::default(),
         }
     }
 
@@ -168,6 +169,7 @@ mod tests {
             upstreams,
             active_route: None,
             filter: crate::filter::FilterRules::default(),
+            silo_floor_filter: crate::filter::FilterRules::default(),
         }
     }
 
