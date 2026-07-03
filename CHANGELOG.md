@@ -11,6 +11,18 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-03
+
+### Fixed
+
+- **Windows packages build again.** The portable-ZIP and MSI packaging scripts
+  still looked for the tray binary in `runic-tray/target/`, but since the Cargo
+  workspace unification everything builds into the workspace-root `target/` —
+  so the release pipeline's Windows job failed before publishing anything. The
+  scripts now ask `cargo metadata` for the real target directory. (The `v0.5.0`
+  tag hit this and never produced a release; 0.5.1 is the first published build
+  of the 0.5 line.)
+
 ## [0.5.0] - 2026-07-02
 
 ### Changed
