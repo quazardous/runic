@@ -11,6 +11,16 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-07-03
+
+### Fixed
+
+- **MSI installer builds again in the workspace layout.** `cargo wix` refuses
+  to run without an explicit package name inside a Cargo workspace; the MSI
+  script now passes `-p runic-tray`. Second and last of the packaging fallouts
+  from the workspace unification (the portable-ZIP path was fixed in 0.5.1,
+  which itself never published because of this one).
+
 ## [0.5.1] - 2026-07-03
 
 ### Fixed

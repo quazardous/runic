@@ -50,10 +50,12 @@ $ver = ($meta.packages | Where-Object { $_.name -eq 'runic-tray' }).version
 $targetDir = $meta.target_directory
 Write-Host "runic-tray $ver — building MSI..."
 
-# cargo wix builds the release binary then runs candle/light.
+# cargo wix builds the release binary then runs candle/light. The explicit
+# package name is required inside a workspace ("Workspace detected. Please
+# pass a package name.").
 Push-Location $tray
 try {
-    cargo wix 2>&1 | Write-Host
+    cargo wix -p runic-tray 2>&1 | Write-Host
     if ($LASTEXITCODE -ne 0) { throw "cargo wix failed" }
 } finally {
     Pop-Location
