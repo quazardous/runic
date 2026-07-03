@@ -21,11 +21,13 @@ $tray = Join-Path $repo 'runic-tray'
 $mingw = 'C:\msys64\mingw64\bin'
 if (Test-Path $mingw) { $env:PATH = "$mingw;$env:PATH" }
 
-# Version via cargo metadata — robust to the workspace-inherited version
-# (`version.workspace = true`), where there is no literal `version = "..."` line
-# in runic-tray/Cargo.toml to grep.
+# Version and target dir via cargo metadata — robust to the workspace layout:
+# the version is inherited (`version.workspace = true`, no literal line to
+# grep) and build output lands in the workspace-root `target/`, not
+# `runic-tray/target/`.
 $meta = cargo metadata --no-deps --format-version 1 --manifest-path (Join-Path $tray 'Cargo.toml') | ConvertFrom-Json
 $ver = ($meta.packages | Where-Object { $_.name -eq 'runic-tray' }).version
+$targetDir = $meta.target_directory
 Write-Host "runic-tray $ver — building release..."
 
 cargo build --release --manifest-path (Join-Path $tray 'Cargo.toml')
@@ -35,7 +37,7 @@ $stage = Join-Path $env:TEMP 'runic-tray-pkg'
 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $stage | Out-Null
 
-Copy-Item (Join-Path $tray 'target\release\runic-tray.exe') $stage
+Copy-Item (Join-Path $targetDir 'release\runic-tray.exe') $stage
 Copy-Item (Join-Path $PSScriptRoot 'runic.yaml.example')     $stage
 Copy-Item (Join-Path $PSScriptRoot 'README-dist.txt') (Join-Path $stage 'README.txt')
 

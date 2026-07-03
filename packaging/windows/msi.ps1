@@ -43,9 +43,11 @@ if (-not $haveCandle) {
     }
 }
 
-# Version via cargo metadata — robust to the workspace-inherited version.
+# Version and target dir via cargo metadata — robust to the workspace layout
+# (inherited version, build output in the workspace-root `target/`).
 $meta = cargo metadata --no-deps --format-version 1 --manifest-path (Join-Path $tray 'Cargo.toml') | ConvertFrom-Json
 $ver = ($meta.packages | Where-Object { $_.name -eq 'runic-tray' }).version
+$targetDir = $meta.target_directory
 Write-Host "runic-tray $ver — building MSI..."
 
 # cargo wix builds the release binary then runs candle/light.
@@ -57,7 +59,7 @@ try {
     Pop-Location
 }
 
-$built = Join-Path $tray "target\wix\runic-tray-$ver-x86_64.msi"
+$built = Join-Path $targetDir "wix\runic-tray-$ver-x86_64.msi"
 if (-not (Test-Path $built)) { throw "expected MSI not found: $built" }
 
 $dist = Join-Path $repo 'dist'
