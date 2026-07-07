@@ -554,6 +554,21 @@ fn html_response(code: u16, reason: &str, body: &str) -> Vec<u8> {
     out
 }
 
+/// Host machine name, detected once per process. Lets a fleet consumer (or a
+/// human with several runic boxes) tell instances apart from the status API
+/// alone. Falls back to `"unknown"` when the OS returns nothing usable.
+fn host_name() -> &'static str {
+    static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        let name = gethostname::gethostname().to_string_lossy().into_owned();
+        if name.is_empty() {
+            "unknown".to_string()
+        } else {
+            name
+        }
+    })
+}
+
 /// Build the enriched `GET /v1/status` body: the **live runtime view** —
 /// version, uptime, listen, the active route, the hot upstream pool, live session
 /// counters, and the silo variations with per-variation connections/requests. All
@@ -641,6 +656,7 @@ async fn status_response(
         &json!({
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION"),
+            "hostname": host_name(),
             "uptime_secs": started.elapsed().as_secs(),
             // Kept for back-compat (existing consumers read it); counts the merged
             // effective pool. The new fields below are the live runtime view.
@@ -954,6 +970,9 @@ mod tests {
         assert!(body.contains("\"upstreams_hot\":[]"), "got: {body}");
         // No silo on this instance.
         assert!(body.contains("\"silo\":{\"enabled\":false}"), "got: {body}");
+        // Host machine name is always present and non-empty.
+        assert!(body.contains("\"hostname\":\""), "got: {body}");
+        assert!(!body.contains("\"hostname\":\"\""), "got: {body}");
     }
 
     #[tokio::test]

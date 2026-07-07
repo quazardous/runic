@@ -63,6 +63,7 @@
        aria-label="runic" role="img"><path d="M6 2 V22 M6 2 H15 L6 12 M6 12 L16 22"/></svg>
   <h1>runic</h1>
   <span class="ver" id="ver"></span>
+  <span class="ver" id="host"></span>
   <span class="conn" id="conn">connecting…</span>
 </header>
 <main>
@@ -119,6 +120,7 @@ function paint(d) {
   el("conn").textContent = "live";
   el("conn").classList.remove("err");
   el("ver").textContent = "v" + (d.version || "?");
+  el("host").textContent = d.hostname ? "on " + d.hostname : "";
   el("listen").textContent = d.listen || "—";
   el("route").innerHTML = d.active_route
     ? d.active_route.name + ' ' + kindPill(d.active_route.kind)
