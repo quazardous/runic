@@ -11,6 +11,10 @@
 # Supersedes the old split (release-core `v*` / release-tray `tray-v*`). The
 # tray's build steps (package.ps1 → cargo-wix → msi.ps1) are reused verbatim.
 #
+# KEEP IN SYNC with packaging-dryrun.yml, which mirrors the risky packaging
+# steps (Linux deb/rpm, Windows ZIP/MSI) to exercise them pre-tag without
+# publishing. If you change a packaging step here, mirror it there.
+#
 # runic-win NOTE: the tray auto-updater must filter `v*` (was `tray-v`) to
 # self-update from these unified releases — see update.rs.
 name: release

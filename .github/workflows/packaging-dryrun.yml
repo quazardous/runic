@@ -1,0 +1,153 @@
+# Packaging dry-run: exercise the release packaging end to end WITHOUT
+# publishing anything.
+#
+# Why: the packaging scripts are otherwise only executed on a `v*` tag, so a
+# broken script surfaces exactly when it hurts most — during a release. Both
+# 0.5.x release failures (stale per-crate target path, `cargo wix` needing an
+# explicit package name in a workspace) were invisible to CI and would have
+# been caught by any pre-tag packaging run.
+#
+# KEEP IN SYNC with release.yml: the build/package steps below are a copy of
+# the release jobs minus the upload/publish parts (deliberate duplication — a
+# reusable workflow_call would complicate the just-proven release pipeline for
+# little gain at this size). If you change a packaging step in release.yml,
+# mirror it here.
+#
+# Coverage: the two risky legs only. Linux x86_64 (deb/rpm tooling) and
+# Windows (portable ZIP + cargo-wix MSI — the leg that broke twice). The
+# macOS/aarch64 legs are plain `cargo build` + tar, already covered by CI.
+name: packaging-dryrun
+
+on:
+  pull_request:
+    paths:
+      - "packaging/**"
+      - "runic-tray/**"
+      - "Cargo.toml"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/packaging-dryrun.yml"
+  push:
+    branches: [main]
+    paths:
+      - "packaging/**"
+      - "runic-tray/**"
+      - "Cargo.toml"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/packaging-dryrun.yml"
+  schedule:
+    # Weekly: catches runner-image / toolchain drift (WiX, cargo-wix, cargo-deb)
+    # even when nothing lands in the repo.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packaging-dryrun-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---- Linux: musl build + .deb + .rpm (mirror of release.yml `linux`,
+  # ---- x86_64/packages leg) -------------------------------------------------
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - uses: cargo-bins/cargo-binstall@main
+      - name: Tooling
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          cargo binstall -y cargo-deb cargo-generate-rpm
+      - name: Build
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p runic
+      - name: Package (dry-run)
+        run: |
+          set -euo pipefail
+          tgt="x86_64-unknown-linux-musl"
+          pkg="runic-dryrun-${tgt}"
+          mkdir -p "dist/${pkg}"
+          cp "target/${tgt}/release/runic" "dist/${pkg}/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/${pkg}/"
+          tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
+          rm -rf "dist/${pkg}"
+          cargo deb --no-build --target "$tgt"
+          cargo generate-rpm --target "$tgt"
+          cp "$(find target -name 'runic_*.deb' | head -1)" dist/
+          cp "$(find target -name 'runic-*.rpm' | head -1)" dist/
+          ( cd dist && for f in *.tar.gz *.deb *.rpm; do [ -e "$f" ] && sha256sum "$f" > "$f.sha256"; done; true )
+      - name: Verify artifacts (then discard)
+        run: |
+          set -euo pipefail
+          ls -la dist
+          for pat in 'dist/*.tar.gz' 'dist/*.deb' 'dist/*.rpm'; do
+            # shellcheck disable=SC2086
+            set -- $pat
+            [ -s "$1" ] || { echo "::error::missing or empty artifact: $pat"; exit 1; }
+          done
+          echo "packaging dry-run OK — artifacts discarded, nothing published"
+
+  # ---- Windows: tray ZIP + MSI + core zip (mirror of release.yml `windows`) --
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build core runic.exe
+        shell: pwsh
+        run: cargo build --release --locked -p runic
+
+      - name: Build tray portable ZIP
+        shell: pwsh
+        run: .\packaging\windows\package.ps1
+
+      # windows-latest ships WiX v3 with %WIX% set; cargo-wix is the missing piece.
+      - name: Install cargo-wix
+        shell: pwsh
+        run: cargo install cargo-wix --locked
+
+      - name: Build MSI installer
+        shell: pwsh
+        run: .\packaging\windows\msi.ps1
+
+      - name: Assemble core zip + checksums (dry-run)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $coredir = "runic-dryrun-x86_64-windows"
+          New-Item -ItemType Directory -Force "dist\$coredir" | Out-Null
+          Copy-Item target\release\runic.exe "dist\$coredir\"
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE "dist\$coredir\"
+          Compress-Archive -Path "dist\$coredir\*" -DestinationPath "dist\$coredir.zip" -Force
+          Remove-Item -Recurse -Force "dist\$coredir"
+          foreach ($a in (Get-ChildItem dist\*.zip, dist\*.msi)) {
+            $sha = "$($a.FullName).sha256"
+            $hash = (Get-FileHash $a.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($a.Name)" | Set-Content -Path $sha -Encoding ascii
+          }
+
+      - name: Verify artifacts (then discard)
+        shell: pwsh
+        run: |
+          Get-ChildItem dist | Format-Table Name, Length
+          $expected = @(
+            "dist\runic-tray-*-windows-x64.zip",
+            "dist\runic-tray-*-windows-x64.msi",
+            "dist\runic-dryrun-x86_64-windows.zip"
+          )
+          foreach ($pat in $expected) {
+            $hit = Get-ChildItem $pat -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 0 }
+            if (-not $hit) { Write-Error "missing or empty artifact: $pat"; exit 1 }
+          }
+          Write-Host "packaging dry-run OK — artifacts discarded, nothing published"
