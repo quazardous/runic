@@ -11,6 +11,8 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-07
+
 ### Added
 
 - **`GET /v1/status` now reports the machine's `hostname`.** Detected once from
