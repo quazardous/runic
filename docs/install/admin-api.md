@@ -95,7 +95,9 @@ upstreams:
 
 `GET /v1/status` returns the **live runtime view** — the current effective route,
 the hot upstream layer, live session counters, and (when silo mode is on) each
-variation with its own counters. A small self-contained HTML page at `GET /`
+variation with its own counters. `hostname` is the machine's own name (detected
+once at first use), so a consumer juggling several runic boxes can tell the
+instances apart from this endpoint alone. A small self-contained HTML page at `GET /`
 consumes this same endpoint and paints it (auto-refreshing); it ships no external
 assets and talks only to the loopback admin port.
 
@@ -103,6 +105,7 @@ assets and talks only to the loopback admin port.
 {
   "status": "ok",
   "version": "0.2.0",
+  "hostname": "scraper-03",
   "uptime_secs": 1234,
   "pool_size": 1,
   "listen": "127.0.0.1:7777",

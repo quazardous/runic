@@ -11,6 +11,13 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+### Added
+
+- **`GET /v1/status` now reports the machine's `hostname`.** Detected once from
+  the OS, `"unknown"` as a fallback — so a consumer (or a human) juggling
+  several runic instances can tell the boxes apart from the status API alone.
+  The status page shows it in the header next to the version.
+
 ## [0.5.2] - 2026-07-03
 
 ### Fixed
