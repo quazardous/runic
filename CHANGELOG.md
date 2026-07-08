@@ -11,6 +11,19 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-08
+
+### Documentation
+
+- **The silo filter floor is confirmed hot-reloadable.** Editing the `filter:`
+  block of the YAML config applies to every silo's *next* CONNECT — already-warm
+  silos included, no restart — like the rest of the cold layer. This was always
+  the design; it is now stated in `docs/install/filtering.md` and pinned by an
+  end-to-end test (real config file, real watcher, warm silo), including the
+  layering guarantees: a runtime admin-API filter never floors a silo and
+  survives a file reload untouched. In-flight tunnels keep the verdict they
+  connected with. No behaviour change.
+
 ## [0.7.0] - 2026-07-08
 
 ### Added
