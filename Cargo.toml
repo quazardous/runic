@@ -7,7 +7,7 @@ default-members = ["."]   # `cargo build`/`test` (no -p) = core only; the tray's
                           # built by its own dedicated job.
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 
 [package]
 name = "runic"

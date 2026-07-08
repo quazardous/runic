@@ -11,6 +11,8 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-08
+
 ### Added
 
 - **The Linux tarball is now self-contained for a no-root install.** Each
