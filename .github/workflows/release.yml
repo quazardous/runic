@@ -70,6 +70,11 @@ jobs:
           mkdir -p "dist/${pkg}"
           cp "target/${tgt}/release/runic" "dist/${pkg}/"
           cp README.md LICENSE-MIT LICENSE-APACHE "dist/${pkg}/"
+          # Self-contained per-user install: the systemd user unit and a
+          # commented example config ship in the tarball, so the no-root path
+          # needs nothing from a repo clone (see docs/install/linux-systemd.md).
+          cp packaging/systemd/runic.service "dist/${pkg}/"
+          cp packaging/linux/runic.yaml "dist/${pkg}/runic.yaml.example"
           tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
           rm -rf "dist/${pkg}"
           if [ "${{ matrix.packages }}" = "true" ]; then

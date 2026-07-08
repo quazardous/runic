@@ -77,6 +77,9 @@ jobs:
           mkdir -p "dist/${pkg}"
           cp "target/${tgt}/release/runic" "dist/${pkg}/"
           cp README.md LICENSE-MIT LICENSE-APACHE "dist/${pkg}/"
+          # Mirror of release.yml: user unit + example config in the tarball.
+          cp packaging/systemd/runic.service "dist/${pkg}/"
+          cp packaging/linux/runic.yaml "dist/${pkg}/runic.yaml.example"
           tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
           rm -rf "dist/${pkg}"
           cargo deb --no-build --target "$tgt"
@@ -92,6 +95,13 @@ jobs:
             # shellcheck disable=SC2086
             set -- $pat
             [ -s "$1" ] || { echo "::error::missing or empty artifact: $pat"; exit 1; }
+          done
+          # The tarball must be self-contained for the per-user install path:
+          # binary + user unit + example config, not just non-empty.
+          set -- dist/*.tar.gz
+          for f in runic runic.service runic.yaml.example; do
+            tar -tzf "$1" | grep -q "/${f}\$" \
+              || { echo "::error::tarball missing ${f}"; exit 1; }
           done
           echo "packaging dry-run OK — artifacts discarded, nothing published"
 

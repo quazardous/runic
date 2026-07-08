@@ -1,12 +1,15 @@
-# Default runic config, installed at /etc/runic/runic.yaml.
-# Marked as a package config file: your edits survive upgrades.
+# Default runic config. The .deb/.rpm packages install it at
+# /etc/runic/runic.yaml (kept on upgrade); the binary tarball ships it as
+# runic.yaml.example for the per-user setup (~/.config/runic/runic.yaml).
 #
 # runic boots with an empty pool — it accepts no traffic until at least one
 # upstream is configured, here or live via the admin API. An unmatched session
 # is refused, never sent out un-proxied. Docs: /usr/share/doc/runic/ and
 # https://github.com/quazardous/runic
 #
-# After editing:  sudo systemctl restart runic   (config is also hot-reloaded)
+# The config is hot-reloaded on edit; only *_env credentials need a restart:
+#   sudo systemctl restart runic      (package install)
+#   systemctl --user restart runic    (per-user install)
 
 listen:
   addr: "127.0.0.1:7777"    # SOCKS5, loopback only (no auth)
@@ -23,6 +26,7 @@ admin:
 #     host: gw.example.com
 #     port: 823
 #     auth:
-#       username_env: RUNIC_UPSTREAM_USER   # set these in /etc/runic/runic.env
-#       password_env: RUNIC_UPSTREAM_PASS
+#       username_env: RUNIC_UPSTREAM_USER   # set these in the unit's env file:
+#       password_env: RUNIC_UPSTREAM_PASS   # /etc/runic/runic.env (package) or
+#                                           # ~/.config/runic/creds.env (per-user)
 upstreams: {}

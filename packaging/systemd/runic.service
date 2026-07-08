@@ -6,7 +6,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/runic --config %h/.config/runic/runic.yaml
-EnvironmentFile=%h/.config/runic/creds.env
+# Optional (leading "-"): only needed when the YAML references *_env
+# credentials. A config with no creds at all (e.g. fully API-driven) must
+# still be able to start.
+EnvironmentFile=-%h/.config/runic/creds.env
+NoNewPrivileges=yes
 Restart=on-failure
 RestartSec=2
 

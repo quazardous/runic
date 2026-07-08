@@ -73,46 +73,55 @@ so your edits survive upgrades and are left behind on removal.
 
 ## B. Prebuilt binary + per-user service
 
-No root, no package — grab the static musl binary from the
-[Releases page](https://github.com/quazardous/runic/releases) and run it as a
-per-user systemd service. The unit template uses systemd's `%h` specifier, so
-all paths are relative to your home — no edits before copying it in.
+No root, no package — grab the tarball for your arch from the
+[Releases page](https://github.com/quazardous/runic/releases). It is
+self-contained: the static musl binary, the per-user systemd unit and a
+commented example config all ship inside, so nothing else is needed. The unit
+uses systemd's `%h` specifier — all paths are relative to your home, no edits
+before copying it in.
 
 ### Files
 
 ```
+runic.tar.gz                                # ships: runic, runic.service, runic.yaml.example
 ~/.local/bin/runic                          # the binary
 ~/.config/systemd/user/runic.service        # the unit
 ~/.config/runic/runic.yaml                  # listen + upstream config
-~/.config/runic/creds.env                   # upstream creds (chmod 600)
+~/.config/runic/creds.env                   # upstream creds (optional, chmod 600)
 ```
 
 ### Install
 
 ```bash
-# 1. binary — download + extract the musl tarball for your arch
+# 1. download + extract the musl tarball for your arch
+v=vX.Y.Z   # pick the latest from the Releases page
 curl -fsSL -o runic.tar.gz \
-  https://github.com/quazardous/runic/releases/download/v0.3.0/runic-v0.3.0-x86_64-unknown-linux-musl.tar.gz
-tar -xzf runic.tar.gz
-mkdir -p ~/.local/bin
-install -m755 runic-v0.3.0-x86_64-unknown-linux-musl/runic ~/.local/bin/
+  "https://github.com/quazardous/runic/releases/download/${v}/runic-${v}-x86_64-unknown-linux-musl.tar.gz"
+tar -xzf runic.tar.gz && cd "runic-${v}-x86_64-unknown-linux-musl"
 
-# 2. config + creds
+# 2. binary
+mkdir -p ~/.local/bin
+install -m755 runic ~/.local/bin/
+
+# 3. config — start from the shipped example, then add your upstream(s)
 mkdir -p ~/.config/runic
-cp docker/runic/runic.yaml ~/.config/runic/runic.yaml      # from a repo clone, or write your own
+cp runic.yaml.example ~/.config/runic/runic.yaml
+"${EDITOR:-vi}" ~/.config/runic/runic.yaml
+
+# 3b. creds — only if your YAML references *_env credentials
 cat > ~/.config/runic/creds.env <<'EOF'
-DATAIMPULSE_LOGIN=your-username
-DATAIMPULSE_PASSWORD=your-password
+RUNIC_UPSTREAM_USER=your-username
+RUNIC_UPSTREAM_PASS=your-password
 EOF
 chmod 600 ~/.config/runic/creds.env
 
-# 3. unit (from a repo clone)
+# 4. unit — shipped in the tarball too
 mkdir -p ~/.config/systemd/user
-cp packaging/systemd/runic.service ~/.config/systemd/user/
+cp runic.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now runic
 
-# 4. verify
+# 5. verify
 systemctl --user status runic
 journalctl --user -u runic -f
 ```
@@ -137,8 +146,11 @@ docker build -t runic:local .
 id=$(docker create runic:local) && docker cp "$id:/usr/local/bin/runic" ./runic && docker rm "$id"
 ```
 
-Then follow [section B](#b-prebuilt-binary--per-user-service) from step 1,
+Then follow [section B](#b-prebuilt-binary--per-user-service) from step 2,
 using `target/release/runic` (or the `./runic` you copied out) as the binary.
+You already have the tarball's two support files in the repo clone:
+`packaging/linux/runic.yaml` is the example config and
+`packaging/systemd/runic.service` is the user unit.
 
 ---
 
