@@ -52,7 +52,10 @@ jobs:
       - name: Tooling
         run: |
           sudo apt-get update && sudo apt-get install -y musl-tools
-          cargo binstall -y cross cargo-deb cargo-generate-rpm
+          # --force: rust-cache can restore ~/.cargo metadata that makes
+          # binstall believe the tools are installed while the binaries are
+          # missing ("no such command: deb"). Prebuilt downloads are cheap.
+          cargo binstall -y --force cross cargo-deb cargo-generate-rpm
       - name: Build
         run: |
           set -euo pipefail
