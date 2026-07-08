@@ -101,9 +101,12 @@ jobs:
           done
           # The tarball must be self-contained for the per-user install path:
           # binary + user unit + example config, not just non-empty.
+          # (List once, then grep the capture: `tar -tzf | grep -q` dies of
+          # SIGPIPE under pipefail when grep exits on an early match.)
           set -- dist/*.tar.gz
+          listing=$(tar -tzf "$1")
           for f in runic runic.service runic.yaml.example; do
-            tar -tzf "$1" | grep -q "/${f}\$" \
+            printf '%s\n' "$listing" | grep -q "/${f}\$" \
               || { echo "::error::tarball missing ${f}"; exit 1; }
           done
           echo "packaging dry-run OK — artifacts discarded, nothing published"
