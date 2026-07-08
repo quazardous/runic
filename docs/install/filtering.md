@@ -134,7 +134,12 @@ never pierce silo isolation. Concretely:
 - **`PUT /v1/filter` without a `Bearer`** → the instance filter for **non-silo**
   sessions only. It does **not** reach any silo (no token-less cross-silo lever).
 - The **file floor** is set in the deployed `filter:` YAML — visible, auditable,
-  changed only by redeploy/hot-reload, never by a live API call.
+  changed only by redeploy/hot-reload, never by a live API call. Like the rest
+  of the cold layer it **follows the file at runtime**: edit the `filter:`
+  block and the new floor applies to the next CONNECT of every silo — already
+  warm ones included — without a restart. In-flight tunnels keep their
+  connect-time verdict, and a live runtime/permanent API filter is neither
+  clobbered by the reload nor promoted into the floor.
 
 ```yaml
 # The file floor: a baseline every silo composes on top of (each silo adds/
