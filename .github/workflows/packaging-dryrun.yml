@@ -66,7 +66,10 @@ jobs:
       - name: Tooling
         run: |
           sudo apt-get update && sudo apt-get install -y musl-tools
-          cargo binstall -y cargo-deb cargo-generate-rpm
+          # --force: rust-cache can restore ~/.cargo metadata that makes
+          # binstall believe the tools are installed while the binaries are
+          # missing ("no such command: deb"). Prebuilt downloads are cheap.
+          cargo binstall -y --force cargo-deb cargo-generate-rpm
       - name: Build
         run: cargo build --release --locked --target x86_64-unknown-linux-musl -p runic
       - name: Package (dry-run)
@@ -77,6 +80,9 @@ jobs:
           mkdir -p "dist/${pkg}"
           cp "target/${tgt}/release/runic" "dist/${pkg}/"
           cp README.md LICENSE-MIT LICENSE-APACHE "dist/${pkg}/"
+          # Mirror of release.yml: user unit + example config in the tarball.
+          cp packaging/systemd/runic.service "dist/${pkg}/"
+          cp packaging/linux/runic.yaml "dist/${pkg}/runic.yaml.example"
           tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
           rm -rf "dist/${pkg}"
           cargo deb --no-build --target "$tgt"
@@ -92,6 +98,16 @@ jobs:
             # shellcheck disable=SC2086
             set -- $pat
             [ -s "$1" ] || { echo "::error::missing or empty artifact: $pat"; exit 1; }
+          done
+          # The tarball must be self-contained for the per-user install path:
+          # binary + user unit + example config, not just non-empty.
+          # (List once, then grep the capture: `tar -tzf | grep -q` dies of
+          # SIGPIPE under pipefail when grep exits on an early match.)
+          set -- dist/*.tar.gz
+          listing=$(tar -tzf "$1")
+          for f in runic runic.service runic.yaml.example; do
+            printf '%s\n' "$listing" | grep -q "/${f}\$" \
+              || { echo "::error::tarball missing ${f}"; exit 1; }
           done
           echo "packaging dry-run OK — artifacts discarded, nothing published"
 

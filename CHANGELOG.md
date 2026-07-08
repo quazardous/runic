@@ -11,6 +11,22 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+### Added
+
+- **The Linux tarball is now self-contained for a no-root install.** Each
+  Linux release tarball ships the per-user systemd unit (`runic.service`) and
+  a commented example config (`runic.yaml.example`) next to the binary — the
+  per-user install path no longer needs anything from a repo clone. The
+  packaging dry-run verifies the tarball layout on every relevant change.
+
+### Fixed
+
+- **The per-user systemd unit starts without a `creds.env`.** The credentials
+  file is now optional in the unit: a config that references no `*_env` at all
+  (for example one driven entirely over the admin API) previously failed to
+  start the service. The unit also gains `NoNewPrivileges` as a hardening
+  baseline.
+
 ## [0.6.0] - 2026-07-07
 
 ### Added
