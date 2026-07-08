@@ -1219,6 +1219,163 @@ mod tests {
             .expect("unblocked host allowed");
     }
 
+    /// The silo floor follows the file at runtime. Full chain under test:
+    /// notify watcher → `Config::load` → `ConfigStore::set_cold` → merge →
+    /// per-session borrow — an edit to the YAML `filter:` must reach the NEXT
+    /// CONNECT of an already-warm silo, with no restart and no re-open. Also
+    /// pins the layering: the admin-API runtime filter never floors a silo,
+    /// and a cold reload never clobbers the runtime filter.
+    #[tokio::test]
+    async fn e2e_file_floor_hot_reloads_into_warm_silo() {
+        use crate::filter::{Action, FilterRules, Rule};
+        use crate::silo::{SiloStore, VariationCache, VariationData};
+        use crate::store::ConfigStore;
+        use std::io::Write as _;
+
+        let upstream_addr = spawn_mock_upstream(MockBehavior::Echo, "alice", "s3cret").await;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Warm silo variation carrying its own upstream and no filter of its own.
+        let mut cache = VariationCache::new(
+            SiloStore::open(dir.path().join("runic.silo"), 3600).unwrap(),
+            3600,
+        );
+        let token = cache.create(0).unwrap();
+        let mut ups = BTreeMap::new();
+        ups.insert(
+            "default".to_string(),
+            Upstream {
+                kind: UpstreamKind::HttpConnect,
+                host: upstream_addr.ip().to_string(),
+                port: upstream_addr.port(),
+                auth: UpstreamCreds {
+                    username: "alice".into(),
+                    password: "s3cret".into(),
+                },
+            },
+        );
+        cache
+            .write(
+                &token,
+                &VariationData {
+                    upstreams: ups,
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap();
+        let silo = Some(Arc::new(Mutex::new(cache)));
+
+        // Real cold YAML on disk, fed through the real watcher.
+        let listen_addr = pick_free_port();
+        let yaml_path = dir.path().join("runic.yaml");
+        let write_yaml = |deny: Option<&str>| {
+            let rules = match deny {
+                Some(host) => format!("\n    - deny: \"{host}\""),
+                None => " []".to_string(),
+            };
+            let yaml = format!(
+                "listen:\n  addr: \"{listen_addr}\"\n  auth: none\nupstreams: {{}}\nfilter:\n  default: allow\n  rules:{rules}\n"
+            );
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .create(true)
+                .open(&yaml_path)
+                .unwrap();
+            f.write_all(yaml.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+        };
+        write_yaml(None);
+
+        let cold = crate::config::Config::load(&yaml_path).unwrap();
+        let (store, cfg_rx) = ConfigStore::new(cold, dir.path().join("runic.snapshot.json"));
+        let store = Arc::new(Mutex::new(store));
+
+        // An admin-API runtime (no-Bearer) filter is live BEFORE any reload: it
+        // must never floor the silo, and the reload must not clobber it either.
+        store.lock().await.set_filter_runtime(FilterRules {
+            default: Action::Allow,
+            rules: vec![Rule::Deny("runtime-only.example".into())],
+        });
+
+        crate::watcher::spawn(yaml_path.clone(), store.clone()).expect("spawn watcher");
+        tokio::spawn({
+            let rx = cfg_rx.clone();
+            async move {
+                let _ = run(rx, silo, Stats::new()).await;
+            }
+        });
+        wait_until_listening(listen_addr).await;
+
+        // Wait until the merged config seen by new sessions satisfies `pred`.
+        async fn wait_merged(
+            rx: &mut watch::Receiver<Arc<Config>>,
+            what: &str,
+            pred: impl Fn(&Config) -> bool,
+        ) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let cur = rx.borrow_and_update().clone();
+                    if pred(&cur) {
+                        return;
+                    }
+                    rx.changed().await.expect("config channel closed");
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("cold reload not observed within 5s: {what}"));
+        }
+        let mut rx = cfg_rx.clone();
+
+        let connect = |host: &'static str| {
+            let t = token.clone();
+            async move {
+                crate::test_helpers::socks5_connect_with_userpass(listen_addr, "", &t, host, 443)
+                    .await
+            }
+        };
+
+        // (1) Empty floor → the target is reachable through the warm silo.
+        connect("later-blocked.example")
+            .await
+            .expect("empty floor must allow the target");
+
+        // (2) A deny lands in the file → the NEXT CONNECT of the still-warm
+        // silo is refused by the new floor rule.
+        write_yaml(Some("later-blocked.example"));
+        wait_merged(&mut rx, "floor rule added", |c| {
+            !c.silo_floor_filter.rules.is_empty()
+        })
+        .await;
+        let e = connect("later-blocked.example").await.unwrap_err();
+        assert!(
+            e.to_string().contains("0x02"),
+            "floor deny → 0x02, got: {e}"
+        );
+
+        // (3) The runtime filter stayed out of the floor (silo unaffected) and
+        // survived the reload (still shadows the merged instance filter).
+        connect("runtime-only.example")
+            .await
+            .expect("runtime (no-Bearer) filter must never floor a silo");
+        assert_eq!(
+            rx.borrow().filter.rules,
+            vec![Rule::Deny("runtime-only.example".into())],
+            "cold reload must not clobber the runtime filter layer"
+        );
+
+        // (4) The deny is removed from the file → the floor reopens.
+        write_yaml(None);
+        wait_merged(&mut rx, "floor rule removed", |c| {
+            c.silo_floor_filter.rules.is_empty()
+        })
+        .await;
+        connect("later-blocked.example")
+            .await
+            .expect("floor must reopen after the rule is removed from the file");
+    }
+
     #[tokio::test]
     async fn e2e_silo_unknown_token_is_refused() {
         let dir = tempfile::tempdir().unwrap();
