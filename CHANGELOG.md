@@ -11,6 +11,8 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-09
+
 ### Changed
 
 - **The default SOCKS5 port is now `7878` (was `7777`), and it is a real
