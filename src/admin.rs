@@ -661,7 +661,15 @@ async fn status_response(
             // Kept for back-compat (existing consumers read it); counts the merged
             // effective pool. The new fields below are the live runtime view.
             "pool_size": merged.upstreams.len(),
-            "listen": merged.listen.addr.to_string(),
+            // The *actually bound* SOCKS5 address. In auto-port mode
+            // (`listen.addr` with port 0) this is the discovery contract: the
+            // fixed admin port is the rendezvous, a client reads the real
+            // SOCKS5 port here. Falls back to the configured address until
+            // the listener has bound; `listen_configured` keeps the raw
+            // config value for audit.
+            "listen": snap.bound_addr.map(|a| a.to_string())
+                .unwrap_or_else(|| merged.listen.addr.to_string()),
+            "listen_configured": merged.listen.addr.to_string(),
             "active_route": active_route,
             // Conservative leak signal for the tray icon: true iff ≥1 active
             // session is routing through a `direct` upstream (local IP exposed).
@@ -973,6 +981,10 @@ mod tests {
         // Host machine name is always present and non-empty.
         assert!(body.contains("\"hostname\":\""), "got: {body}");
         assert!(!body.contains("\"hostname\":\"\""), "got: {body}");
+        // No SOCKS5 server runs in this harness → no bound addr published, so
+        // `listen` falls back to the configured address, kept in
+        // `listen_configured` for audit.
+        assert!(body.contains("\"listen_configured\":\""), "got: {body}");
     }
 
     #[tokio::test]

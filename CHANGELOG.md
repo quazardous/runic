@@ -11,6 +11,18 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+### Added
+
+- **Auto-port mode: let the OS pick the SOCKS5 port.** Set
+  `listen.addr: "127.0.0.1:0"` and runic binds a free ephemeral port — no
+  collision with anything, ever. The fixed admin port is the rendezvous:
+  `GET /v1/status` (and the status page) now report the **actually bound**
+  address in `listen`, so a client starts runic, reads the port there, and
+  points its SOCKS5 traffic at it — the same discovery contract as the silo
+  per-variation ports. The raw config value stays available as
+  `listen_configured`. On a hot-reload rebind the reported address follows
+  (in auto mode a rebind may mint a new port; in-flight sessions keep theirs).
+
 ## [0.8.0] - 2026-07-09
 
 ### Changed
