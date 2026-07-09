@@ -11,6 +11,8 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-09
+
 ### Added
 
 - **Auto-port mode: let the OS pick the SOCKS5 port.** Set
