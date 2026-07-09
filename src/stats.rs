@@ -9,6 +9,7 @@
 //! request count survives idle eviction (warm→cold→warm) instead of resetting.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use crate::config::UpstreamKind;
@@ -22,6 +23,11 @@ struct Inner {
     /// Cumulative CONNECTs refused by the domain filter (never begins a session).
     filtered_total: u64,
     per_variation: HashMap<String, VarCounters>,
+    /// The SOCKS5 listener's *actually bound* address, published on every
+    /// (re)bind. Differs from the configured `listen.addr` in auto-port mode
+    /// (`addr: "…:0"`), where the OS picks the port and the status surface is
+    /// how a client discovers it. `None` until the first bind.
+    bound_addr: Option<SocketAddr>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -52,6 +58,8 @@ pub struct StatsSnapshot {
     pub active_direct: u64,
     pub requests_total: u64,
     pub filtered_total: u64,
+    /// Actually bound SOCKS5 address (see [`Stats::set_bound_addr`]).
+    pub bound_addr: Option<SocketAddr>,
     per_variation: HashMap<String, VarStat>,
 }
 
@@ -110,6 +118,14 @@ impl Stats {
         }
     }
 
+    /// Publish the SOCKS5 listener's actually-bound address. Called by the
+    /// server task after every successful (re)bind — this is what makes
+    /// auto-port mode (`listen.addr` with port `0`) discoverable: the fixed
+    /// admin port serves the real port via `GET /v1/status`.
+    pub fn set_bound_addr(&self, addr: SocketAddr) {
+        self.inner.lock().expect("stats lock").bound_addr = Some(addr);
+    }
+
     pub fn snapshot(&self) -> StatsSnapshot {
         let g = self.inner.lock().expect("stats lock");
         StatsSnapshot {
@@ -117,6 +133,7 @@ impl Stats {
             active_direct: g.active_direct,
             requests_total: g.requests_total,
             filtered_total: g.filtered_total,
+            bound_addr: g.bound_addr,
             per_variation: g
                 .per_variation
                 .iter()

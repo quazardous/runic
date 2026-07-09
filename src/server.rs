@@ -39,12 +39,17 @@ pub async fn run(
     stats: Arc<Stats>,
 ) -> Result<()> {
     let initial = cfg_rx.borrow().clone();
+    // `current_addr` tracks the *configured* address (for change detection on
+    // reload); the actually bound one can differ in auto-port mode (port 0,
+    // the OS picks) and is published to the status surface via `Stats`.
     let mut current_addr = initial.listen.addr;
     let mut listener = TcpListener::bind(current_addr)
         .await
         .with_context(|| format!("bind SOCKS5 listener on {current_addr}"))?;
+    let bound = listener.local_addr().unwrap_or(current_addr);
+    stats.set_bound_addr(bound);
     info!(
-        addr = %current_addr,
+        addr = %bound,
         upstream_default = %default_label(&initial),
         pool_size = initial.upstreams.len(),
         "runic listening"
@@ -82,8 +87,10 @@ pub async fn run(
                     match TcpListener::bind(new_addr).await {
                         Ok(new_l) => {
                             current_addr = new_addr;
+                            let bound = new_l.local_addr().unwrap_or(new_addr);
+                            stats.set_bound_addr(bound);
                             listener = new_l;
-                            info!(addr = %current_addr, "rebound");
+                            info!(addr = %bound, "rebound");
                         }
                         Err(e) => {
                             warn!(target_addr = %new_addr, error = %e, "rebind failed; staying on previous addr");
@@ -788,6 +795,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn e2e_auto_port_publishes_bound_addr_and_serves() {
+        let upstream_addr = spawn_mock_upstream(MockBehavior::Echo, "alice", "s3cret").await;
+        // Auto-port mode: configure port 0, the OS picks a free port.
+        let auto_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = cfg_for(auto_addr, upstream_addr, "alice", "s3cret");
+        let (_tx, rx) = watch::channel(Arc::new(cfg));
+
+        let stats = Stats::new();
+        let stats_srv = stats.clone();
+        tokio::spawn(async move {
+            let _ = run(rx, None, stats_srv).await;
+        });
+
+        // Discovery contract: the actually bound address (real, non-zero port)
+        // is published to the stats snapshot — the value `/v1/status` serves.
+        let bound = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(a) = stats.snapshot().bound_addr {
+                    if a.port() != 0 {
+                        return a;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bound addr not published within 5s");
+
+        let mut tunnel = socks5_connect(bound, "auto.target.example", 443)
+            .await
+            .expect("SOCKS5 CONNECT via the auto-minted port should succeed");
+        let payload = b"ping-via-auto-port";
+        let echoed = echo_roundtrip(&mut tunnel, payload).await.unwrap();
+        assert_eq!(echoed, payload);
+    }
+
+    #[tokio::test]
     async fn e2e_filter_deny_refuses_connect_with_0x02() {
         use crate::filter::{Action, FilterRules, Rule};
 
@@ -1486,10 +1530,13 @@ mod tests {
         let cfg1 = cfg_for(addr1, upstream_addr, "u", "p");
         let (tx, rx) = watch::channel(Arc::new(cfg1));
 
+        let stats = Stats::new();
+        let stats_srv = stats.clone();
         tokio::spawn(async move {
-            let _ = run(rx, None, Stats::new()).await;
+            let _ = run(rx, None, stats_srv).await;
         });
         wait_until_listening(addr1).await;
+        assert_eq!(stats.snapshot().bound_addr, Some(addr1));
 
         // Sanity: addr1 works.
         let mut t1 = socks5_connect(addr1, "any.example", 443).await.unwrap();
@@ -1507,6 +1554,8 @@ mod tests {
         let mut t2 = socks5_connect(addr2, "any.example", 443).await.unwrap();
         let echoed = echo_roundtrip(&mut t2, b"on-addr2").await.unwrap();
         assert_eq!(echoed, b"on-addr2");
+        // The published bound addr follows the rebind.
+        assert_eq!(stats.snapshot().bound_addr, Some(addr2));
 
         // And addr1 should now refuse — listener was dropped.
         let dial_old = tokio::net::TcpStream::connect(addr1).await;

@@ -16,7 +16,8 @@
 #   systemctl --user restart runic    (per-user install)
 
 # SOCKS5 data plane — loopback only (no auth): the bind address is the trust
-# boundary, do not expose it off-host.
+# boundary, do not expose it off-host. Port 0 = auto mode: the OS picks a free
+# port; read the real one from GET /v1/status (`listen`) on the admin port.
 # listen:
 #   addr: "127.0.0.1:7878"
 #   auth: none
