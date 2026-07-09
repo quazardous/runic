@@ -54,7 +54,7 @@ boundary, exactly like the SOCKS5 surface. Do not expose it off-host.
 
 ```yaml
 listen:
-  addr: "0.0.0.0:7777"
+  addr: "0.0.0.0:7878"
   auth: none
 
 admin:
@@ -108,7 +108,7 @@ assets and talks only to the loopback admin port.
   "hostname": "scraper-03",
   "uptime_secs": 1234,
   "pool_size": 1,
-  "listen": "127.0.0.1:7777",
+  "listen": "127.0.0.1:7878",
   "active_route": { "name": "dataimpulse-fr", "kind": "http_connect" },
   "any_active_direct": false,
   "active_sessions": 2,

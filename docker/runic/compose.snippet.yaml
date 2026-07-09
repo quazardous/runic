@@ -1,6 +1,6 @@
 # Snippet à coller dans le `services:` du docker-compose qui héberge runic en
-# sidecar. Contrat externe : SOCKS5 loopback sur 127.0.0.1:7777, le client
-# consomme `socks5://127.0.0.1:7777`.
+# sidecar. Contrat externe : SOCKS5 loopback sur 127.0.0.1:7878, le client
+# consomme `socks5://127.0.0.1:7878`.
 #
 # runic n'a pas d'admin API dans cette release (statique). Si tu veux SIGHUP /
 # reload à chaud / smart routing → version ultérieure.
@@ -18,7 +18,7 @@ services:
     container_name: runic
     restart: unless-stopped
     ports:
-      - "127.0.0.1:7777:7777"     # loopback only — pas exposé LAN
+      - "127.0.0.1:7878:7878"     # loopback only — pas exposé LAN
     volumes:
       - ./docker/runic/runic.yaml:/etc/runic/runic.yaml:ro
     environment:

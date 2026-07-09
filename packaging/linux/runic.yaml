@@ -2,6 +2,10 @@
 # /etc/runic/runic.yaml (kept on upgrade); the binary tarball ships it as
 # runic.yaml.example for the per-user setup (~/.config/runic/runic.yaml).
 #
+# Every key below is commented out: each shows its BUILT-IN DEFAULT, which
+# applies as long as the key stays commented. Uncomment only what you change —
+# an entirely commented file is a valid config.
+#
 # runic boots with an empty pool — it accepts no traffic until at least one
 # upstream is configured, here or live via the admin API. An unmatched session
 # is refused, never sent out un-proxied. Docs: /usr/share/doc/runic/ and
@@ -11,15 +15,18 @@
 #   sudo systemctl restart runic      (package install)
 #   systemctl --user restart runic    (per-user install)
 
-listen:
-  addr: "127.0.0.1:7777"    # SOCKS5, loopback only (no auth)
-  auth: none
+# SOCKS5 data plane — loopback only (no auth): the bind address is the trust
+# boundary, do not expose it off-host.
+# listen:
+#   addr: "127.0.0.1:7878"
+#   auth: none
 
-admin:
-  addr: "127.0.0.1:48484"   # loopback admin API + status page (http://127.0.0.1:48484/)
+# Admin API + status page (http://127.0.0.1:48484/), loopback only. Boot-time
+# setting: changing it needs a restart, not just a reload.
+# admin:
+#   addr: "127.0.0.1:48484"
 
-# Add at least one upstream to carry traffic, e.g.:
-#
+# Upstream pool — empty by default. Add at least one entry to carry traffic:
 # upstreams:
 #   default:
 #     kind: http_connect
@@ -29,4 +36,16 @@ admin:
 #       username_env: RUNIC_UPSTREAM_USER   # set these in the unit's env file:
 #       password_env: RUNIC_UPSTREAM_PASS   # /etc/runic/runic.env (package) or
 #                                           # ~/.config/runic/creds.env (per-user)
-upstreams: {}
+
+# Domain filter at CONNECT time — off by default (allow everything). Also the
+# static floor every silo composes over. See docs/install/filtering.md.
+# filter:
+#   default: allow
+#   rules:
+#     - deny: "*.doubleclick.net"
+
+# Encrypted per-client config mode — opt-in. See docs/install/silo.md.
+# silo:
+#   enabled: false
+#   ttl_days: 7
+#   auth: rfc1929

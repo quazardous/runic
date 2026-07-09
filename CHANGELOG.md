@@ -11,6 +11,24 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+### Changed
+
+- **The default SOCKS5 port is now `7878` (was `7777`), and it is a real
+  built-in default.** `7777` sits in a range other local tools commonly grab;
+  `7878` is quieter — same reasoning as the admin port's earlier move to
+  `48484`. Until now the port was only a convention repeated in the shipped
+  configs and docs; `listen:` now has a code-level default
+  (`127.0.0.1:7878`, no auth) and — like `admin:` — can be omitted entirely.
+  Existing installs are unaffected: every shipped config sets `listen.addr`
+  explicitly and package upgrades keep the edited `/etc/runic/runic.yaml`; only
+  setups recreating a config from the new docs/examples pick up the new port.
+
+- **The shipped default config is fully commented out.** Every key in the
+  packaged `/etc/runic/runic.yaml` (and the tarball's `runic.yaml.example`) now
+  ships commented, each showing its built-in default — uncomment only what you
+  change. An empty or comment-only config file is now valid and boots runic
+  entirely on defaults (loopback listeners, empty pool, no filter).
+
 ## [0.7.1] - 2026-07-08
 
 ### Documentation

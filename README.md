@@ -13,7 +13,7 @@ to route (a browser, an HTTP library, an automation tool) often only speaks
 only no-auth SOCKS5. runic bridges that gap: it exposes a local **no-auth
 SOCKS5** port, holds the upstream credentials itself, and re-originates every
 connection through the authenticated gateway. The client just points at
-`127.0.0.1:7777` and never sees — or needs to know — the upstream or its creds.
+`127.0.0.1:7878` and never sees — or needs to know — the upstream or its creds.
 
 That keeps secrets off the client, lets you swap or rotate the upstream without
 touching the client, and (in *silo* mode) gives each client its own encrypted,
@@ -26,11 +26,11 @@ inspect or rewrite traffic.
 +--------+   SOCKS5    +--------+   HTTP CONNECT    +-------------+   HTTPS    +--------+
 | client | ----------> | runic  | ----------------> | DataImpulse | ---------> | target |
 +--------+ 127.0.0.1   +--------+ gw.dataimpulse    +-------------+            +--------+
-            :7777                  .com:823
+            :7878                  .com:823
             (no auth)              (basic auth)
 ```
 
-- **Listen**: SOCKS5 on `127.0.0.1:7777` (no auth; loopback exposure enforced by
+- **Listen**: SOCKS5 on `127.0.0.1:7878` (no auth; loopback exposure enforced by
   the deployment, see install docs).
 - **Upstream**: HTTP CONNECT to a single fixed DataImpulse gateway, with
   `Proxy-Authorization: Basic` from env-injected creds.
@@ -108,7 +108,7 @@ at `/etc/runic/runic.yaml`):
 
 ```yaml
 listen:
-  addr: "0.0.0.0:7777"        # bound inside container; loopback exposure via host port mapping
+  addr: "0.0.0.0:7878"        # bound inside container; loopback exposure via host port mapping
   auth: none
 
 admin:                        # optional; runtime/permanent admin API (v0.6), loopback only
