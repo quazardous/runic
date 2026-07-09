@@ -23,11 +23,15 @@ humans, not machines"), and the project follows
   explicitly and package upgrades keep the edited `/etc/runic/runic.yaml`; only
   setups recreating a config from the new docs/examples pick up the new port.
 
-- **The shipped default config is fully commented out.** Every key in the
-  packaged `/etc/runic/runic.yaml` (and the tarball's `runic.yaml.example`) now
-  ships commented, each showing its built-in default — uncomment only what you
+- **The shipped default config is fully commented out — on every OS.** Each
+  key ships commented, showing its built-in default; uncomment only what you
   change. An empty or comment-only config file is now valid and boots runic
-  entirely on defaults (loopback listeners, empty pool, no filter).
+  entirely on defaults (loopback listeners, empty pool, no filter). This covers
+  the packaged `/etc/runic/runic.yaml`, the Linux **and macOS** tarballs'
+  `runic.yaml.example` (macOS previously shipped no config at all), the Windows
+  ZIP/MSI example, and the config the tray writes on first "Open config". The
+  Windows example also drops its divergent `1080` listen port in favour of the
+  product-wide `7878` default.
 
 ## [0.7.1] - 2026-07-08
 

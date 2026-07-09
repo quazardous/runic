@@ -115,6 +115,9 @@ jobs:
           mkdir -p "dist/${pkg}"
           cp "target/${{ matrix.target }}/release/runic" "dist/${pkg}/"
           cp README.md LICENSE-MIT LICENSE-APACHE "dist/${pkg}/"
+          # Same commented example config as the Linux tarball — every key
+          # documents its built-in default (a comment-only file is valid).
+          cp packaging/linux/runic.yaml "dist/${pkg}/runic.yaml.example"
           tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
           rm -rf "dist/${pkg}"
           ( cd dist && shasum -a 256 "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256" )
