@@ -42,11 +42,29 @@ impl Config {
     }
 }
 
+/// SOCKS5 data-plane listener config. Loopback by default — the listener has
+/// no auth (outside silo binding), so the bind address is the trust boundary.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Listen {
+    #[serde(default = "default_listen_addr")]
     pub addr: SocketAddr,
     #[serde(default)]
     pub auth: ListenAuth,
+}
+
+/// `7878` rather than the crowded `7777` neighbourhood, mirroring the admin
+/// port's "quiet default" stance (see [`Admin`]).
+fn default_listen_addr() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 7878))
+}
+
+impl Default for Listen {
+    fn default() -> Self {
+        Self {
+            addr: default_listen_addr(),
+            auth: ListenAuth::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -149,8 +167,13 @@ impl std::fmt::Debug for UpstreamCreds {
     }
 }
 
-#[derive(Debug, Deserialize)]
+/// Every field defaults, so a config that sets nothing — or a file that is
+/// nothing but comments — boots on built-in defaults (loopback listeners,
+/// empty pool, no filter). The shipped package config relies on this: it is
+/// fully commented out, documenting the defaults instead of restating them.
+#[derive(Debug, Default, Deserialize)]
 struct RawFile {
+    #[serde(default)]
     listen: Listen,
     #[serde(default)]
     admin: Admin,
@@ -286,8 +309,11 @@ impl Config {
     pub fn load_with_admin(path: &Path) -> Result<(Self, Admin, Option<SiloConfig>)> {
         let raw =
             fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
-        let file: RawFile =
-            serde_yaml::from_str(&raw).with_context(|| format!("parse YAML {}", path.display()))?;
+        // `Option<_>`: an empty or comment-only file parses as a null document,
+        // which must mean "all defaults", not a parse error.
+        let file: RawFile = serde_yaml::from_str::<Option<RawFile>>(&raw)
+            .with_context(|| format!("parse YAML {}", path.display()))?
+            .unwrap_or_default();
 
         // An empty pool, or a pool without a `default` entry, is valid: runic
         // tolerates a bare config and is driven live via the admin API. Sessions
@@ -327,7 +353,7 @@ mod tests {
     fn yaml_with(kind: &str, user_env: &str, pass_env: &str) -> String {
         format!(
             r#"listen:
-  addr: "127.0.0.1:7777"
+  addr: "127.0.0.1:7878"
 upstreams:
   default:
     kind: {kind}
@@ -345,6 +371,28 @@ upstreams:
         f.write_all(content.as_bytes()).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    #[test]
+    fn comment_only_yaml_boots_on_defaults() {
+        // The shipped package config is fully commented out — it must load as
+        // "all built-in defaults", the same as an absent key-by-key config.
+        let f = write_tmp("# every key commented out\n# listen:\n#   addr: \"127.0.0.1:7878\"\n");
+        let (cfg, admin, silo) = Config::load_with_admin(f.path()).expect("comment-only loads");
+        assert_eq!(cfg.listen.addr, "127.0.0.1:7878".parse().unwrap());
+        assert_eq!(admin.addr, "127.0.0.1:48484".parse().unwrap());
+        assert!(cfg.upstreams.is_empty());
+        assert!(silo.is_none());
+        assert!(cfg.filter.rules.is_empty());
+        assert!(cfg.silo_floor_filter.rules.is_empty());
+    }
+
+    #[test]
+    fn listen_defaults_when_only_addr_missing() {
+        // `listen:` present but `addr` omitted — the field-level default kicks in.
+        let f = write_tmp("listen:\n  auth: none\nupstreams: {}\n");
+        let cfg = Config::load(f.path()).expect("addr-less listen loads");
+        assert_eq!(cfg.listen.addr, "127.0.0.1:7878".parse().unwrap());
     }
 
     #[test]
@@ -377,7 +425,7 @@ upstreams:
         std::env::set_var("RUNIC_T_CFG_P_US", "us_pass");
 
         let yaml = r#"listen:
-  addr: "127.0.0.1:7777"
+  addr: "127.0.0.1:7878"
 upstreams:
   default:
     kind: http_connect
@@ -408,7 +456,7 @@ upstreams:
         // An empty pool is valid now (silo / API-driven mode): runic boots and
         // is configured live via the admin API.
         let yaml = r#"listen:
-  addr: "127.0.0.1:7777"
+  addr: "127.0.0.1:7878"
 upstreams: {}
 "#;
         let f = write_tmp(yaml);
@@ -422,7 +470,7 @@ upstreams: {}
         std::env::set_var("RUNIC_T_CFG_U_NODEF", "u");
         std::env::set_var("RUNIC_T_CFG_P_NODEF", "p");
         let yaml = r#"listen:
-  addr: "127.0.0.1:7777"
+  addr: "127.0.0.1:7878"
 upstreams:
   primary:
     kind: http_connect
@@ -445,7 +493,7 @@ upstreams:
         // One test (not two) so the process-global `RUNIC_ALLOW_DIRECT` mutation
         // is sequential — no parallel-test race. No other test touches this var.
         let yaml = r#"listen:
-  addr: "127.0.0.1:7777"
+  addr: "127.0.0.1:7878"
 upstreams:
   default:
     kind: direct
@@ -470,7 +518,7 @@ upstreams:
     #[test]
     fn http_connect_missing_host_errors() {
         let yaml = r#"listen:
-  addr: "127.0.0.1:7777"
+  addr: "127.0.0.1:7878"
 upstreams:
   default:
     kind: http_connect
@@ -486,7 +534,7 @@ upstreams:
     #[test]
     fn parses_silo_config() {
         let yaml = r#"listen:
-  addr: "127.0.0.1:7777"
+  addr: "127.0.0.1:7878"
 silo:
   enabled: true
   ttl_days: 14
@@ -503,12 +551,12 @@ silo:
     #[test]
     fn silo_absent_is_none_and_defaults_apply() {
         // Absent silo section → None.
-        let f = write_tmp("listen:\n  addr: \"127.0.0.1:7777\"\nupstreams: {}\n");
+        let f = write_tmp("listen:\n  addr: \"127.0.0.1:7878\"\nupstreams: {}\n");
         let (_c, _a, silo) = Config::load_with_admin(f.path()).unwrap();
         assert!(silo.is_none());
 
         // Enabled with no auth/ttl given → defaults: 7 days, rfc1929.
-        let f2 = write_tmp("listen:\n  addr: \"127.0.0.1:7777\"\nsilo:\n  enabled: true\n");
+        let f2 = write_tmp("listen:\n  addr: \"127.0.0.1:7878\"\nsilo:\n  enabled: true\n");
         let (_c2, _a2, silo2) = Config::load_with_admin(f2.path()).unwrap();
         let s = silo2.unwrap();
         assert_eq!(s.ttl_days, 7);
@@ -519,7 +567,7 @@ silo:
     fn parses_filter_section() {
         use crate::filter::{Action, Rule};
         let yaml = r#"listen:
-  addr: "127.0.0.1:7777"
+  addr: "127.0.0.1:7878"
 upstreams: {}
 filter:
   default: allow
@@ -539,7 +587,7 @@ filter:
 
     #[test]
     fn filter_absent_is_noop() {
-        let f = write_tmp("listen:\n  addr: \"127.0.0.1:7777\"\nupstreams: {}\n");
+        let f = write_tmp("listen:\n  addr: \"127.0.0.1:7878\"\nupstreams: {}\n");
         let cfg = Config::load(f.path()).unwrap();
         assert!(cfg.filter.is_noop());
     }

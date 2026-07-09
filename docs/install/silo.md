@@ -24,7 +24,7 @@ fingerprint of the token plus the ciphertext on disk.
 
 ```yaml
 listen:
-  addr: "0.0.0.0:7777"
+  addr: "0.0.0.0:7878"
   auth: none
 
 silo:
@@ -137,7 +137,7 @@ through it. Use this for SOCKS5 clients that support auth (curl `--proxy-user`,
 most SDK HTTP clients).
 
 ```
-socks5h://<anything>:<token>@127.0.0.1:7777
+socks5h://<anything>:<token>@127.0.0.1:7878
 ```
 
 ### `none` (loopback port binding)

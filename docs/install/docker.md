@@ -9,7 +9,7 @@ inside the container).
 ```bash
 docker build -t runic:0.1 .
 docker run --rm -it \
-  -p 127.0.0.1:7777:7777 \
+  -p 127.0.0.1:7878:7878 \
   -v "$PWD/docker/runic/runic.yaml:/etc/runic/runic.yaml:ro" \
   -e DATAIMPULSE_LOGIN=... \
   -e DATAIMPULSE_PASSWORD=... \
@@ -32,7 +32,7 @@ services:
     container_name: runic
     restart: unless-stopped
     ports:
-      - "127.0.0.1:7777:7777"     # loopback only — not exposed on the LAN
+      - "127.0.0.1:7878:7878"     # loopback only — not exposed on the LAN
     volumes:
       - ./docker/runic/runic.yaml:/etc/runic/runic.yaml:ro
     environment:
@@ -55,14 +55,14 @@ gateway. With mock creds → curl reports a SOCKS5 connection failure and the
 container logs show the upstream's `HTTP 407 Proxy Authentication Required`,
 which already proves the CONNECT chain works.
 
-## Local-dev note: port 7777 already in use
+## Local-dev note: port 7878 already in use
 
-If `127.0.0.1:7777` is taken on your dev box, remap the host side of the port
-mapping — the container still listens on `7777` internally:
+If `127.0.0.1:7878` is taken on your dev box, remap the host side of the port
+mapping — the container still listens on `7878` internally:
 
 ```
 ports:
-  - "127.0.0.1:7780:7777"     # dev-only host remap
+  - "127.0.0.1:7780:7878"     # dev-only host remap
 ```
 
 Then run the smoke test with `PROXY=127.0.0.1:7780 ./scripts/smoke.sh`.

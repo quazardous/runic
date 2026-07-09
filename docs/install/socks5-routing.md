@@ -49,13 +49,13 @@ provider-level secret overrides. Send an empty string.
 
 ```bash
 # Route via the upstream named `us-residential` (must exist in YAML pool)
-curl --socks5 "provider=us-residential:@127.0.0.1:7777" https://api.ipify.org
+curl --socks5 "provider=us-residential:@127.0.0.1:7878" https://api.ipify.org
 
 # No routing intent — runic uses the `default` upstream
-curl --socks5 127.0.0.1:7777 https://api.ipify.org
+curl --socks5 127.0.0.1:7878 https://api.ipify.org
 
 # Reserve a sticky-session id (no-op today, ready for v0.7.1)
-curl --socks5 "provider=fr;sessid=abc123:@127.0.0.1:7777" https://api.ipify.org
+curl --socks5 "provider=fr;sessid=abc123:@127.0.0.1:7878" https://api.ipify.org
 ```
 
 ### Chrome extension (Manifest v3)
@@ -69,7 +69,7 @@ chrome.proxy.settings.set({
       singleProxy: {
         scheme: 'socks5',
         host: '127.0.0.1',
-        port: 7777,
+        port: 7878,
         username: `provider=${providerName};sessid=${sessionId}`,
         password: '',
       },
@@ -87,7 +87,7 @@ extension.
 
 ```yaml
 listen:
-  addr: "0.0.0.0:7777"
+  addr: "0.0.0.0:7878"
   auth: none
 
 upstreams:

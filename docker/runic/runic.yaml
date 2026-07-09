@@ -1,7 +1,7 @@
 # runic — SOCKS5 local → DataImpulse upstream
 #
 # Listens loopback (binding to 0.0.0.0 inside the container; loopback exposure is
-# enforced by docker-compose port mapping `127.0.0.1:7777:7777`), no auth on the
+# enforced by docker-compose port mapping `127.0.0.1:7878:7878`), no auth on the
 # SOCKS5 surface (loopback only), upstream HTTP CONNECT to DataImpulse static
 # gateway with creds from env.
 #
@@ -14,7 +14,7 @@
 # route exists). A session with no matching upstream and no `default` is refused.
 
 listen:
-  addr: "0.0.0.0:7777"
+  addr: "0.0.0.0:7878"
   auth: none
 
 # Admin API (v0.6, see docs/install/admin-api.md): runtime/permanent config.

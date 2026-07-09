@@ -1,25 +1,30 @@
 # runic config — copy this to %APPDATA%\runic\runic.yaml and edit.
 #
 # The tray reads %APPDATA%\runic\runic.yaml (NOT this file next to the exe).
-# An empty pool is valid: runic boots and declines sessions until an upstream is
-# pushed over the admin API. See the project docs for the full reference.
+#
+# Every key below is commented out: each shows its BUILT-IN DEFAULT, which
+# applies as long as the key stays commented. Uncomment only what you change —
+# an entirely commented file is a valid config. An empty upstream pool is
+# valid too: runic boots and declines sessions until an upstream is pushed
+# over the admin API. See the project docs for the full reference.
 
-listen:
-  addr: "127.0.0.1:1080"   # local SOCKS5 endpoint your apps point at
-  auth: none               # loopback only — no auth on the SOCKS5 surface
+# SOCKS5 data plane your apps point at — loopback only (no auth): the bind
+# address is the trust boundary, do not expose it off-host.
+# listen:
+#   addr: "127.0.0.1:7878"
+#   auth: none
 
-admin:
-  addr: "127.0.0.1:48484"   # loopback admin API (hot config / status page)
+# Admin API + status page (http://127.0.0.1:48484/), loopback only.
+# admin:
+#   addr: "127.0.0.1:48484"
 
-# Named upstream pool. Clients always hit the same loopback endpoint above;
-# runic decides which upstream the traffic exits through. Leave empty to boot
-# unconfigured and drive everything over the admin API.
-upstreams: {}
-
-#  default:
-#    kind: http_connect
-#    host: gw.example-provider.com
-#    port: 823
-#    auth:
-#      username_env: PROXY_LOGIN     # creds come from the environment, never the file
-#      password_env: PROXY_PASSWORD
+# Named upstream pool — empty by default. Clients always hit the same loopback
+# endpoint above; runic decides which upstream the traffic exits through.
+# upstreams:
+#   default:
+#     kind: http_connect
+#     host: gw.example-provider.com
+#     port: 823
+#     auth:
+#       username_env: RUNIC_UPSTREAM_USER   # creds come from the environment
+#       password_env: RUNIC_UPSTREAM_PASS   # (user env vars), never the file

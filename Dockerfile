@@ -26,7 +26,7 @@ RUN touch src/main.rs src/lib.rs && cargo build --release --locked -p runic
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /build/target/release/runic /usr/local/bin/runic
-EXPOSE 7777
+EXPOSE 7878
 # Admin API + status page (off by default to loopback inside the container; bind
 # admin.addr to 0.0.0.0 and publish this port to reach it from the host).
 EXPOSE 48484

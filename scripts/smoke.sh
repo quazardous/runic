@@ -8,14 +8,14 @@
 #     Still proves the wiring is good — only the creds need to be fixed.
 #
 # Usage:
-#   ./scripts/smoke.sh                 # default: 127.0.0.1:7777
-#   PROXY=127.0.0.1:7777 ./scripts/smoke.sh
+#   ./scripts/smoke.sh                 # default: 127.0.0.1:7878
+#   PROXY=127.0.0.1:7878 ./scripts/smoke.sh
 #
 # Exits 0 on a 200 response, 1 otherwise.
 
 set -euo pipefail
 
-PROXY="${PROXY:-127.0.0.1:7777}"
+PROXY="${PROXY:-127.0.0.1:7878}"
 TARGET="${TARGET:-https://api.ipify.org?format=json}"
 
 echo "→ curl --socks5 ${PROXY} ${TARGET}"

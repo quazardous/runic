@@ -66,16 +66,22 @@ enum UserEvent {
     Quit,
 }
 
-/// A minimal commented config written on first "Open config file" when none
-/// exists yet (boot-empty model: upstreams are pushed later over the admin API).
+/// A minimal config written on first "Open config file" when none exists yet.
+/// Fully commented out — every key shows its built-in default, and a
+/// comment-only file is a valid config (boot-empty model: upstreams are
+/// pushed later over the admin API).
 const CONFIG_EXAMPLE: &str = "\
 # runic configuration — SOCKS5 listener + upstreams.
-# The tray runs boot-empty: add upstreams here or push them over the admin API.
+# Each key below shows its BUILT-IN DEFAULT, applied while the key stays
+# commented; uncomment only what you change. The tray runs boot-empty: add
+# upstreams here or push them over the admin API.
 # Docs: https://github.com/quazardous/runic
-listen:
-  addr: \"127.0.0.1:1080\"
-  auth: none
-upstreams: {}
+# listen:
+#   addr: \"127.0.0.1:7878\"
+#   auth: none
+# admin:
+#   addr: \"127.0.0.1:48484\"
+# upstreams: {}
 ";
 
 /// Owns the tokio runtime and the running proxy tasks. Start spins the core up;

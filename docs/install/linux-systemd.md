@@ -1,9 +1,9 @@
 # Install — Linux
 
-Three ways to run `runic` on Linux, easiest first:
+Three ways to get `runic` onto a Linux box, easiest first:
 
-| # | Path | Service model | Needs |
-| - | ---- | ------------- | ----- |
+| # | Binary comes from | Default service model | Needs |
+| - | ----------------- | --------------------- | ----- |
 | **A** | [`.deb` / `.rpm` package](#a-from-a-package-recommended) | **system** unit, runs at boot under a transient `DynamicUser` | root, a release |
 | **B** | [Prebuilt binary tarball](#b-prebuilt-binary--per-user-service) | **per-user** unit (`systemctl --user`), no root | a release |
 | **C** | [Build from source](#c-build-from-source) | **per-user** unit | a Rust toolchain (or Docker) |
@@ -11,6 +11,12 @@ Three ways to run `runic` on Linux, easiest first:
 A is the standard distro path — one command installs the binary, a default
 config, and a hardened service. B and C give you a no-root, per-user daemon and
 are the way to go on a box where you can't (or don't want to) install a package.
+
+The table pairs each install with its *natural* service model, but the two axes
+are independent: the per-user unit runs **any** runic binary. In particular you
+can install the package for the binary and clean upgrades, yet run the service
+in your own session — see
+[Packaged binary, per-user service](#packaged-binary-per-user-service).
 
 The daemon hot-reloads its YAML config when you edit it (all paths) — see
 [Hot reload](#hot-reload).
@@ -69,6 +75,56 @@ Remove with `sudo apt remove runic` / `sudo dnf remove runic`; the uninstall
 disables and stops the service first. `/etc/runic/runic.yaml` is a config file,
 so your edits survive upgrades and are left behind on removal.
 
+### Packaged binary, per-user service
+
+The system unit is the *default* way to run the binary the package installs —
+not the only one. To keep the package (binary + upgrades via `apt`/`dnf`) but
+run runic in **your own session**, skip steps 1–4 above entirely — config and
+creds live in your home instead, editable without `sudo` — and point a per-user
+unit at `/usr/bin/runic`:
+
+```bash
+# config lives in your home; the packaged default is a fine starting point
+mkdir -p ~/.config/runic
+cp /etc/runic/runic.yaml ~/.config/runic/runic.yaml
+"${EDITOR:-vi}" ~/.config/runic/runic.yaml   # add your upstream(s)
+
+# same unit as the tarball's (section B) — only ExecStart differs
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/runic.service <<'EOF'
+[Unit]
+Description=runic — local SOCKS5 to upstream HTTP CONNECT proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/runic --config %h/.config/runic/runic.yaml
+EnvironmentFile=-%h/.config/runic/creds.env
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+EOF
+systemctl --user daemon-reload
+systemctl --user enable --now runic
+```
+
+Everything else from [section B](#b-prebuilt-binary--per-user-service) applies
+unchanged: the optional `~/.config/runic/creds.env`, lingering, the smoke test.
+
+Two caveats:
+
+- **Don't run both.** If the system service is enabled, disable it first
+  (`sudo systemctl disable --now runic`) — otherwise the two instances fight
+  over the same loopback ports.
+- **Don't `systemctl edit` a `User=you` into the system unit instead.** Its
+  hardening assumes `DynamicUser`: `ProtectHome=yes` would lock a `User=you`
+  service out of your own home, and `/var/lib/runic` keeps its previous owner.
+  The per-user unit above is the supported shape.
+
 ---
 
 ## B. Prebuilt binary + per-user service
@@ -79,6 +135,11 @@ self-contained: the static musl binary, the per-user systemd unit and a
 commented example config all ship inside, so nothing else is needed. The unit
 uses systemd's `%h` specifier — all paths are relative to your home, no edits
 before copying it in.
+
+(The same per-user service also runs a package-installed or self-built binary —
+only `ExecStart` changes. See the
+[packaged variant](#packaged-binary-per-user-service) and
+[section C](#c-build-from-source).)
 
 ### Files
 
@@ -159,7 +220,7 @@ You already have the tarball's two support files in the repo clone:
 Whichever path you took:
 
 ```bash
-curl --socks5 127.0.0.1:7777 https://api.ipify.org
+curl --socks5 127.0.0.1:7878 https://api.ipify.org
 ```
 
 With real creds → an HTTP 200 and an IP from the upstream. With mock creds →
@@ -198,7 +259,7 @@ What is **not** hot-reloadable: credentials read from an `EnvironmentFile`
 sed -i 's/host: gw.dataimpulse.com/host: example.invalid/' ~/.config/runic/runic.yaml
 
 # Wait < 1s for the watcher to pick it up, then:
-curl --socks5 127.0.0.1:7777 https://api.ipify.org
+curl --socks5 127.0.0.1:7878 https://api.ipify.org
 # → curl reports a SOCKS5 failure (proves the new upstream is in effect)
 
 # Restore
@@ -211,7 +272,7 @@ sed -i 's/host: example.invalid/host: gw.dataimpulse.com/' ~/.config/runic/runic
 # package install (A)
 sudo apt remove runic        # or: sudo dnf remove runic
 
-# per-user install (B / C)
+# per-user service (B / C, or the per-user variant of A)
 systemctl --user disable --now runic
 rm ~/.config/systemd/user/runic.service
 systemctl --user daemon-reload
