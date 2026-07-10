@@ -513,6 +513,7 @@ mod tests {
         Config {
             listen: Listen {
                 addr: "127.0.0.1:7878".parse::<SocketAddr>().unwrap(),
+                port_range: None,
                 auth: ListenAuth::None,
             },
             upstreams,

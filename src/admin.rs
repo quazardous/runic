@@ -840,6 +840,7 @@ mod tests {
         let cold = Config {
             listen: Listen {
                 addr: "127.0.0.1:0".parse().unwrap(),
+                port_range: None,
                 auth: ListenAuth::None,
             },
             upstreams,
@@ -873,6 +874,7 @@ mod tests {
         let cold = Config {
             listen: Listen {
                 addr: "127.0.0.1:0".parse().unwrap(),
+                port_range: None,
                 auth: ListenAuth::None,
             },
             upstreams: BTreeMap::new(),
@@ -1352,6 +1354,7 @@ mod tests {
         let cold = Config {
             listen: Listen {
                 addr: "127.0.0.1:0".parse().unwrap(),
+                port_range: None,
                 auth: ListenAuth::None,
             },
             upstreams,

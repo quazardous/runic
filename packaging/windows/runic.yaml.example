@@ -9,11 +9,14 @@
 # over the admin API. See the project docs for the full reference.
 
 # SOCKS5 data plane your apps point at — loopback only (no auth): the bind
-# address is the trust boundary, do not expose it off-host. Port 0 = auto
-# mode: the OS picks a free port; read the real one from GET /v1/status
-# (`listen`) on the admin port.
+# address is the trust boundary, do not expose it off-host. Port 0 (the
+# default) = auto mode: the OS picks a free port; read the real one from
+# GET /v1/status (`listen`) on the fixed admin port. For a stable port,
+# uncomment addr with an explicit port (e.g. "127.0.0.1:7878"), or keep
+# port 0 and set port_range to scan a window — first free port wins.
 # listen:
-#   addr: "127.0.0.1:7878"
+#   addr: "127.0.0.1:0"
+#   port_range: "20000-20100"   # optional; only with port 0 (no built-in default)
 #   auth: none
 
 # Admin API + status page (http://127.0.0.1:48484/), loopback only.

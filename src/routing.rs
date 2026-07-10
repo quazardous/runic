@@ -108,6 +108,7 @@ mod tests {
         Config {
             listen: Listen {
                 addr: "127.0.0.1:0".parse().unwrap(),
+                port_range: None,
                 auth: ListenAuth::None,
             },
             upstreams,
@@ -164,6 +165,7 @@ mod tests {
         Config {
             listen: Listen {
                 addr: "127.0.0.1:0".parse().unwrap(),
+                port_range: None,
                 auth: ListenAuth::None,
             },
             upstreams,

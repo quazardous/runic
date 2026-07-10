@@ -39,13 +39,14 @@ pub async fn run(
     stats: Arc<Stats>,
 ) -> Result<()> {
     let initial = cfg_rx.borrow().clone();
-    // `current_addr` tracks the *configured* address (for change detection on
-    // reload); the actually bound one can differ in auto-port mode (port 0,
-    // the OS picks) and is published to the status surface via `Stats`.
+    // `current_addr`/`current_range` track the *configured* listen surface (for
+    // change detection on reload); the actually bound addr can differ in
+    // auto-port mode (port 0, the OS or the range scan picks) and is published
+    // to the status surface via `Stats`. Comparing the configured values means
+    // a reload with an unchanged config never rebinds — no new port is minted.
     let mut current_addr = initial.listen.addr;
-    let mut listener = TcpListener::bind(current_addr)
-        .await
-        .with_context(|| format!("bind SOCKS5 listener on {current_addr}"))?;
+    let mut current_range = initial.listen.port_range;
+    let mut listener = bind_listen(&initial.listen).await?;
     let bound = listener.local_addr().unwrap_or(current_addr);
     stats.set_bound_addr(bound);
     info!(
@@ -82,11 +83,13 @@ pub async fn run(
                 let new_cfg = cfg_rx.borrow().clone();
                 warn_on_direct(&new_cfg);
                 let new_addr = new_cfg.listen.addr;
-                if new_addr != current_addr {
-                    info!(old = %current_addr, new = %new_addr, "listen addr changed; attempting rebind");
-                    match TcpListener::bind(new_addr).await {
+                let new_range = new_cfg.listen.port_range;
+                if new_addr != current_addr || new_range != current_range {
+                    info!(old = %current_addr, new = %new_addr, "listen config changed; attempting rebind");
+                    match bind_listen(&new_cfg.listen).await {
                         Ok(new_l) => {
                             current_addr = new_addr;
+                            current_range = new_range;
                             let bound = new_l.local_addr().unwrap_or(new_addr);
                             stats.set_bound_addr(bound);
                             listener = new_l;
@@ -102,6 +105,39 @@ pub async fn run(
             }
         }
     }
+}
+
+/// Bind the SOCKS5 listener honouring auto-port semantics. With a configured
+/// port of `0` and a `port_range`, scan the range sequentially and take the
+/// first free port — sequential on purpose: a restart almost always lands on
+/// the same port (semi-stable) without pinning it. Otherwise bind as-is
+/// (explicit port, or pure OS-picked ephemeral when the port is `0`).
+async fn bind_listen(listen: &crate::config::Listen) -> Result<TcpListener> {
+    if listen.addr.port() == 0 {
+        if let Some(range) = &listen.port_range {
+            let mut last_err = None;
+            for port in range.min..=range.max {
+                let mut addr = listen.addr;
+                addr.set_port(port);
+                match TcpListener::bind(addr).await {
+                    Ok(l) => return Ok(l),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            let detail = last_err
+                .map(|e| format!(" (last error: {e})"))
+                .unwrap_or_default();
+            bail!(
+                "no free port in listen.port_range {}-{} on {}{detail}",
+                range.min,
+                range.max,
+                listen.addr.ip()
+            );
+        }
+    }
+    TcpListener::bind(listen.addr)
+        .await
+        .with_context(|| format!("bind SOCKS5 listener on {}", listen.addr))
 }
 
 /// Registry of `none`-mode dedicated loopback listeners — one no-auth SOCKS5
@@ -754,6 +790,7 @@ mod tests {
         Config {
             listen: Listen {
                 addr: listen_addr,
+                port_range: None,
                 auth: ListenAuth::None,
             },
             upstreams,
@@ -827,6 +864,63 @@ mod tests {
             .await
             .expect("SOCKS5 CONNECT via the auto-minted port should succeed");
         let payload = b"ping-via-auto-port";
+        let echoed = echo_roundtrip(&mut tunnel, payload).await.unwrap();
+        assert_eq!(echoed, payload);
+    }
+
+    #[tokio::test]
+    async fn e2e_port_range_skips_taken_port_and_serves() {
+        use crate::config::PortRange;
+
+        let upstream_addr = spawn_mock_upstream(MockBehavior::Echo, "alice", "s3cret").await;
+
+        // Occupy a free port p, then hand the server the window [p, p+20]:
+        // the sequential scan must skip p (taken by `blocker`) and land on a
+        // later port inside the window.
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = blocker.local_addr().unwrap().port();
+        let range = PortRange {
+            min: p,
+            max: p.saturating_add(20),
+        };
+
+        let auto_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut cfg = cfg_for(auto_addr, upstream_addr, "alice", "s3cret");
+        cfg.listen.port_range = Some(range);
+        let (_tx, rx) = watch::channel(Arc::new(cfg));
+
+        let stats = Stats::new();
+        let stats_srv = stats.clone();
+        tokio::spawn(async move {
+            let _ = run(rx, None, stats_srv).await;
+        });
+
+        let bound = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(a) = stats.snapshot().bound_addr {
+                    if a.port() != 0 {
+                        return a;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bound addr not published within 5s");
+
+        assert_ne!(bound.port(), p, "must skip the occupied range head");
+        assert!(
+            (range.min..=range.max).contains(&bound.port()),
+            "bound port {} must sit inside the window {}-{}",
+            bound.port(),
+            range.min,
+            range.max
+        );
+
+        let mut tunnel = socks5_connect(bound, "range.target.example", 443)
+            .await
+            .expect("SOCKS5 CONNECT via the range-scanned port should succeed");
+        let payload = b"ping-via-port-range";
         let echoed = echo_roundtrip(&mut tunnel, payload).await.unwrap();
         assert_eq!(echoed, payload);
     }
@@ -976,6 +1070,7 @@ mod tests {
         Config {
             listen: Listen {
                 addr: listen_addr,
+                port_range: None,
                 auth: ListenAuth::None,
             },
             upstreams,
@@ -1142,6 +1237,7 @@ mod tests {
         let cfg = Config {
             listen: Listen {
                 addr: listen_addr,
+                port_range: None,
                 auth: ListenAuth::None,
             },
             upstreams: BTreeMap::new(),
@@ -1214,6 +1310,7 @@ mod tests {
         let cfg = Config {
             listen: Listen {
                 addr: listen_addr,
+                port_range: None,
                 auth: ListenAuth::None,
             },
             upstreams: BTreeMap::new(),
@@ -1432,6 +1529,7 @@ mod tests {
         let cfg = Config {
             listen: Listen {
                 addr: listen_addr,
+                port_range: None,
                 auth: ListenAuth::None,
             },
             upstreams: BTreeMap::new(),
@@ -1502,6 +1600,7 @@ mod tests {
         let cfg = Config {
             listen: Listen {
                 addr: pick_free_port(),
+                port_range: None,
                 auth: ListenAuth::None,
             },
             upstreams: BTreeMap::new(),
