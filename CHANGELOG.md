@@ -11,6 +11,8 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-10
+
 ### Changed
 
 - **Auto-port is now the default.** With `listen:` unset (or fully commented,
