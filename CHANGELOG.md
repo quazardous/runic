@@ -11,6 +11,8 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-10
+
 ### Added
 
 - **The domain filter accepts IPv6 literals, in the standard bracket form.**
