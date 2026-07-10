@@ -48,22 +48,83 @@ impl Config {
 pub struct Listen {
     #[serde(default = "default_listen_addr")]
     pub addr: SocketAddr,
+    /// Optional `"min-max"` window for auto-port mode: only meaningful when the
+    /// configured port is `0`. The server scans the range sequentially and
+    /// takes the first free port — semi-stable across restarts (a restart
+    /// almost always lands on the same port) without pinning it. Combining a
+    /// range with an explicit non-zero port is rejected as contradictory.
+    #[serde(default)]
+    pub port_range: Option<PortRange>,
     #[serde(default)]
     pub auth: ListenAuth,
 }
 
-/// `7878` rather than the crowded `7777` neighbourhood, mirroring the admin
-/// port's "quiet default" stance (see [`Admin`]).
+/// Port `0` = auto-port mode: the OS picks a free port and the fixed admin
+/// port (48484) is the rendezvous — clients read the real port from
+/// `GET /v1/status` (`listen`). This kills the port-collision class outright;
+/// a fixed port is one uncomment away in the shipped config.
 fn default_listen_addr() -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], 7878))
+    SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
 impl Default for Listen {
     fn default() -> Self {
         Self {
             addr: default_listen_addr(),
+            port_range: None,
             auth: ListenAuth::default(),
         }
+    }
+}
+
+impl Listen {
+    /// Semantic validation that spans fields (the wire format of each field is
+    /// checked at deserialize time). Called by the cold-YAML loader.
+    fn validate(&self) -> Result<()> {
+        if self.port_range.is_some() && self.addr.port() != 0 {
+            return Err(anyhow!(
+                "listen.port_range is only meaningful with an auto-port addr (port 0); \
+                 listen.addr {} pins the port explicitly — drop one of the two",
+                self.addr
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Inclusive `min-max` port window for auto-port mode. Deserialized from a
+/// `"20000-20100"` string; both bounds must be non-zero and ordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortRange {
+    pub min: u16,
+    pub max: u16,
+}
+
+impl<'de> Deserialize<'de> for PortRange {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let s = String::deserialize(deserializer)?;
+        let (min, max) = s
+            .split_once('-')
+            .ok_or_else(|| D::Error::custom(format!("port_range '{s}': expected \"min-max\"")))?;
+        let parse = |part: &str, which: &str| {
+            part.trim()
+                .parse::<u16>()
+                .map_err(|e| D::Error::custom(format!("port_range '{s}': bad {which} port: {e}")))
+        };
+        let (min, max) = (parse(min, "min")?, parse(max, "max")?);
+        if min == 0 {
+            return Err(D::Error::custom(format!(
+                "port_range '{s}': min must be >= 1 (0 would re-enter pure auto-port)"
+            )));
+        }
+        if min > max {
+            return Err(D::Error::custom(format!("port_range '{s}': min > max")));
+        }
+        Ok(PortRange { min, max })
     }
 }
 
@@ -314,6 +375,9 @@ impl Config {
         let file: RawFile = serde_yaml::from_str::<Option<RawFile>>(&raw)
             .with_context(|| format!("parse YAML {}", path.display()))?
             .unwrap_or_default();
+        file.listen
+            .validate()
+            .with_context(|| format!("invalid listen section in {}", path.display()))?;
 
         // An empty pool, or a pool without a `default` entry, is valid: runic
         // tolerates a bare config and is driven live via the admin API. Sessions
@@ -377,9 +441,12 @@ upstreams:
     fn comment_only_yaml_boots_on_defaults() {
         // The shipped package config is fully commented out — it must load as
         // "all built-in defaults", the same as an absent key-by-key config.
-        let f = write_tmp("# every key commented out\n# listen:\n#   addr: \"127.0.0.1:7878\"\n");
+        let f = write_tmp("# every key commented out\n# listen:\n#   addr: \"127.0.0.1:0\"\n");
         let (cfg, admin, silo) = Config::load_with_admin(f.path()).expect("comment-only loads");
-        assert_eq!(cfg.listen.addr, "127.0.0.1:7878".parse().unwrap());
+        // Default listen = auto-port: loopback, port 0 (the OS picks; clients
+        // discover the real port via the status surface on the fixed admin port).
+        assert_eq!(cfg.listen.addr, "127.0.0.1:0".parse().unwrap());
+        assert_eq!(cfg.listen.port_range, None);
         assert_eq!(admin.addr, "127.0.0.1:48484".parse().unwrap());
         assert!(cfg.upstreams.is_empty());
         assert!(silo.is_none());
@@ -392,7 +459,52 @@ upstreams:
         // `listen:` present but `addr` omitted — the field-level default kicks in.
         let f = write_tmp("listen:\n  auth: none\nupstreams: {}\n");
         let cfg = Config::load(f.path()).expect("addr-less listen loads");
-        assert_eq!(cfg.listen.addr, "127.0.0.1:7878".parse().unwrap());
+        assert_eq!(cfg.listen.addr, "127.0.0.1:0".parse().unwrap());
+    }
+
+    #[test]
+    fn port_range_parses_and_requires_auto_port() {
+        let f = write_tmp("listen:\n  addr: \"127.0.0.1:0\"\n  port_range: \"20000-20100\"\n");
+        let cfg = Config::load(f.path()).expect("range with auto-port loads");
+        assert_eq!(
+            cfg.listen.port_range,
+            Some(PortRange {
+                min: 20000,
+                max: 20100
+            })
+        );
+
+        // Contradictory: a range next to an explicitly pinned port.
+        let f = write_tmp("listen:\n  addr: \"127.0.0.1:7878\"\n  port_range: \"20000-20100\"\n");
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("invalid listen section"), "got: {err}");
+    }
+
+    #[test]
+    fn port_range_rejects_malformed_windows() {
+        for (yaml, why) in [
+            ("listen:\n  port_range: \"20100-20000\"\n", "min > max"),
+            ("listen:\n  port_range: \"0-100\"\n", "zero min"),
+            ("listen:\n  port_range: \"20000\"\n", "no dash"),
+            ("listen:\n  port_range: \"20000-99999\"\n", "max > u16"),
+        ] {
+            let f = write_tmp(yaml);
+            assert!(Config::load(f.path()).is_err(), "should reject: {why}");
+        }
+    }
+
+    #[test]
+    fn port_range_single_port_window_is_valid() {
+        // "p-p" = "this port if free, else fail" — a degenerate but legal window.
+        let f = write_tmp("listen:\n  port_range: \"20050-20050\"\n");
+        let cfg = Config::load(f.path()).expect("single-port window loads");
+        assert_eq!(
+            cfg.listen.port_range,
+            Some(PortRange {
+                min: 20050,
+                max: 20050
+            })
+        );
     }
 
     #[test]

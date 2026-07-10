@@ -76,8 +76,12 @@ const CONFIG_EXAMPLE: &str = "\
 # commented; uncomment only what you change. The tray runs boot-empty: add
 # upstreams here or push them over the admin API.
 # Docs: https://github.com/quazardous/runic
+# Port 0 (the default) = auto mode: the OS picks the SOCKS5 port; read the
+# real one on the status page. Uncomment addr with an explicit port to pin
+# it, or keep port 0 and set port_range to scan a window instead.
 # listen:
-#   addr: \"127.0.0.1:7878\"
+#   addr: \"127.0.0.1:0\"
+#   port_range: \"20000-20100\"
 #   auth: none
 # admin:
 #   addr: \"127.0.0.1:48484\"

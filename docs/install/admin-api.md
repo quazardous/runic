@@ -129,13 +129,15 @@ assets and talks only to the loopback admin port.
 ```
 
 - `listen` — the SOCKS5 address **actually bound**, which is the point of
-  **auto-port mode**: set `listen.addr: "127.0.0.1:0"` and the OS picks a free
-  port — no collision with anything, ever. The fixed admin port is the
-  rendezvous: a client starts runic, reads `listen` here, and points its SOCKS5
-  traffic at it (the same discovery contract as the silo `none`-mode
-  per-variation ports). `listen_configured` keeps the raw config value for
-  audit. On a hot-reload rebind, `listen` follows; in auto-port mode a rebind
-  may mint a **new** port (in-flight sessions keep theirs).
+  **auto-port mode** (the **default**: `listen.addr` is `"127.0.0.1:0"` when
+  unset): the OS picks a free port — no collision with anything, ever. The
+  fixed admin port is the rendezvous: a client starts runic, reads `listen`
+  here, and points its SOCKS5 traffic at it (the same discovery contract as
+  the silo `none`-mode per-variation ports). With `port_range: "min-max"` the
+  port is scanned inside that window instead (first free wins — semi-stable
+  across restarts). `listen_configured` keeps the raw config value for audit.
+  On a hot-reload rebind, `listen` follows; in auto-port mode a rebind may
+  mint a **new** port (in-flight sessions keep theirs).
 - `active_route` — the upstream a no-provider session resolves to right now
   (`null` for an empty / default-less pool), with its **kind**.
 - `any_active_direct` — `true` iff at least one **active** session is routing

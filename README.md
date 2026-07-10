@@ -12,8 +12,8 @@ to route (a browser, an HTTP library, an automation tool) often only speaks
 **plain SOCKS5** and can't present those credentials — Chromium, notably, offers
 only no-auth SOCKS5. runic bridges that gap: it exposes a local **no-auth
 SOCKS5** port, holds the upstream credentials itself, and re-originates every
-connection through the authenticated gateway. The client just points at
-`127.0.0.1:7878` and never sees — or needs to know — the upstream or its creds.
+connection through the authenticated gateway. The client just points at the
+local port and never sees — or needs to know — the upstream or its creds.
 
 That keeps secrets off the client, lets you swap or rotate the upstream without
 touching the client, and (in *silo* mode) gives each client its own encrypted,
@@ -26,12 +26,16 @@ inspect or rewrite traffic.
 +--------+   SOCKS5    +--------+   HTTP CONNECT    +-------------+   HTTPS    +--------+
 | client | ----------> | runic  | ----------------> | DataImpulse | ---------> | target |
 +--------+ 127.0.0.1   +--------+ gw.dataimpulse    +-------------+            +--------+
-            :7878                  .com:823
+            :<port>                .com:823
             (no auth)              (basic auth)
 ```
 
-- **Listen**: SOCKS5 on `127.0.0.1:7878` (no auth; loopback exposure enforced by
-  the deployment, see install docs).
+- **Listen**: no-auth SOCKS5 on loopback. **Auto-port by default**: the OS picks
+  a free port and clients read the real one from `GET /v1/status` (`listen`) on
+  the fixed admin port (`127.0.0.1:48484`) — no port collisions, ever. Pin an
+  explicit port (`addr: "127.0.0.1:7878"`) or scan a window
+  (`port_range: "20000-20100"`, first free port wins, semi-stable across
+  restarts) when a stable port matters.
 - **Upstream**: HTTP CONNECT to a single fixed DataImpulse gateway, with
   `Proxy-Authorization: Basic` from env-injected creds.
 - **Pump**: pure `tokio::io::copy_bidirectional` after handshake — no inspection,
@@ -108,8 +112,9 @@ at `/etc/runic/runic.yaml`):
 
 ```yaml
 listen:
-  addr: "0.0.0.0:7878"        # bound inside container; loopback exposure via host port mapping
-  auth: none
+  addr: "0.0.0.0:7878"        # explicit port (containers need a stable mapping);
+  auth: none                  # default is "127.0.0.1:0" = auto-port, discover via
+                              # /v1/status; or port_range: "20000-20100" to scan a window
 
 admin:                        # optional; runtime/permanent admin API (v0.6), loopback only
   addr: "127.0.0.1:48484"

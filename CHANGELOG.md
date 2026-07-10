@@ -11,6 +11,31 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Auto-port is now the default.** With `listen:` unset (or fully commented,
+  as the shipped configs are) the built-in default is `127.0.0.1:0`: the OS
+  picks a free SOCKS5 port and clients read the real one from `GET /v1/status`
+  (`listen`) on the fixed admin port — the discovery contract introduced in
+  0.9.0 becomes the nominal path, and the port-collision class disappears
+  entirely on fresh installs. A stable port is one uncomment away
+  (`listen.addr: "127.0.0.1:7878"`). Existing installs are unaffected: a
+  config that pins `listen.addr` keeps behaving exactly as before, and package
+  upgrades keep the edited `/etc/runic/runic.yaml`. The Docker image is
+  unchanged too (its config pins the port explicitly — containers want a
+  stable port mapping).
+
+### Added
+
+- **Optional `listen.port_range: "min-max"` for auto-port mode.** Instead of a
+  fully OS-picked ephemeral port, scan the given window and bind the first
+  free port. The scan is sequential on purpose: a restart almost always lands
+  back on the same port — **semi-stable** without pinning anything. Only
+  meaningful with port `0`; combining it with an explicit port is rejected at
+  config load with a clear error, as are malformed windows (`min > max`,
+  `0-…`). If the whole window is taken, runic refuses to boot with an error
+  naming the range.
+
 ## [0.9.0] - 2026-07-09
 
 ### Added

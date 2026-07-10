@@ -8,14 +8,27 @@
 #     Still proves the wiring is good — only the creds need to be fixed.
 #
 # Usage:
-#   ./scripts/smoke.sh                 # default: 127.0.0.1:7878
-#   PROXY=127.0.0.1:7878 ./scripts/smoke.sh
+#   ./scripts/smoke.sh                 # default: auto-discover the port via the
+#                                      # admin status endpoint (ADMIN, :48484)
+#   PROXY=127.0.0.1:7878 ./scripts/smoke.sh   # explicit/pinned port
 #
 # Exits 0 on a 200 response, 1 otherwise.
 
 set -euo pipefail
 
-PROXY="${PROXY:-127.0.0.1:7878}"
+ADMIN="${ADMIN:-127.0.0.1:48484}"
+# Default listen is auto-port (the OS picks): read the actually-bound address
+# from the status surface unless the caller pins PROXY explicitly.
+if [[ -z "${PROXY:-}" ]]; then
+  PROXY="$(curl -sS --max-time 5 "http://${ADMIN}/v1/status" \
+    | sed -n 's/.*"listen":"\([^"]*\)".*/\1/p')"
+  if [[ -z "${PROXY}" ]]; then
+    echo "✗ could not discover the SOCKS5 port from http://${ADMIN}/v1/status" >&2
+    echo "  (is runic running? or set PROXY=host:port explicitly)" >&2
+    exit 1
+  fi
+  echo "→ discovered SOCKS5 endpoint ${PROXY} via http://${ADMIN}/v1/status"
+fi
 TARGET="${TARGET:-https://api.ipify.org?format=json}"
 
 echo "→ curl --socks5 ${PROXY} ${TARGET}"

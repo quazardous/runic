@@ -217,11 +217,17 @@ You already have the tarball's two support files in the repo clone:
 
 ## Smoke test
 
-Whichever path you took:
+Whichever path you took — with the default config the SOCKS5 port is
+auto-picked by the OS, so first read the real one from the status endpoint
+(the admin port is fixed):
 
 ```bash
-curl --socks5 127.0.0.1:7878 https://api.ipify.org
+PROXY=$(curl -s http://127.0.0.1:48484/v1/status | grep -o '"listen":"[^"]*"' | cut -d'"' -f4)
+curl --socks5 "$PROXY" https://api.ipify.org
 ```
+
+(If you pinned an explicit port in `listen.addr`, use it directly:
+`curl --socks5 127.0.0.1:7878 …`.)
 
 With real creds → an HTTP 200 and an IP from the upstream. With mock creds →
 curl reports a SOCKS5 failure and the journal shows the upstream `HTTP 407`,
@@ -245,7 +251,7 @@ change, debounced ~100 ms.
 | Field changed                                    | What happens                                                                  |
 | ------------------------------------------------ | ----------------------------------------------------------------------------- |
 | `upstream.host` / `port` / `auth.*_env`          | Next session uses the new values; in-flight sessions keep their connect-time settings. |
-| `listen.addr`                                    | The listener rebinds. If the new bind fails (port in use), the daemon keeps listening on the previous address and logs a warning. |
+| `listen.addr` / `listen.port_range`              | The listener rebinds (in auto-port mode this mints a new port — re-read it from `/v1/status`). If the new bind fails (port in use), the daemon keeps listening on the previous address and logs a warning. A reload that doesn't touch these keys never rebinds. |
 | Invalid YAML / parse error                       | Warning logged, previous config stays live. The daemon does not crash.        |
 
 What is **not** hot-reloadable: credentials read from an `EnvironmentFile`
@@ -258,8 +264,8 @@ What is **not** hot-reloadable: credentials read from an `EnvironmentFile`
 # Edit the default upstream host to something that resolves but can't accept the chain
 sed -i 's/host: gw.dataimpulse.com/host: example.invalid/' ~/.config/runic/runic.yaml
 
-# Wait < 1s for the watcher to pick it up, then:
-curl --socks5 127.0.0.1:7878 https://api.ipify.org
+# Wait < 1s for the watcher to pick it up, then (reusing $PROXY from the smoke test):
+curl --socks5 "$PROXY" https://api.ipify.org
 # → curl reports a SOCKS5 failure (proves the new upstream is in effect)
 
 # Restore
