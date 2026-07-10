@@ -88,9 +88,9 @@ impl TryFrom<RuleWire> for Rule {
 /// - a wildcard on a literal (`*.` next to brackets): wildcards are for
 ///   domain names; an address has no subdomains.
 fn validate_pattern(p: &str) -> Result<(), String> {
-    if p.starts_with('[') {
+    if let Some(rest) = p.strip_prefix('[') {
         // Bracketed IPv6 literal: [addr] or [addr]:port.
-        let Some((inner, after)) = p[1..].split_once(']') else {
+        let Some((inner, after)) = rest.split_once(']') else {
             return Err(format!(
                 "filter pattern '{p}': unclosed '[' — use [ipv6] or [ipv6]:port"
             ));
