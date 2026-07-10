@@ -173,17 +173,62 @@ pub struct FilterRules {
     /// Ordered rules; the first whose pattern matches the target decides.
     #[serde(default)]
     pub rules: Vec<Rule>,
+    /// Dry-run mode (firewalld-style): a `deny` verdict produced by THIS
+    /// ruleset is logged and counted but the CONNECT goes through — for
+    /// validating an allowlist under real traffic before enforcing it.
+    /// Absent/false = enforce (the previous behaviour; old snapshots and silo
+    /// blobs load unchanged).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub log_only: bool,
+}
+
+/// Which ruleset layer produced a verdict — the key for per-rule hit counters
+/// and for resolving whose `log_only` flag governs a deny.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Layer {
+    /// A silo variation's own filter.
+    Silo,
+    /// The merged instance filter (file + admin-API overlays); non-silo
+    /// sessions only.
+    Instance,
+    /// The static file floor a silo composes on top of.
+    Floor,
+}
+
+/// A filter verdict plus its provenance: which layer decided, and whether a
+/// rule (by index) or that layer's `default` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Decision {
+    pub action: Action,
+    pub layer: Layer,
+    /// Index of the deciding rule in the layer's ruleset; `None` when the
+    /// layer's `default` action decided.
+    pub rule: Option<usize>,
 }
 
 impl FilterRules {
     /// First-match-wins verdict for `host:port`, falling back to `default`.
     pub fn decide(&self, host: &str, port: u16) -> Action {
-        for rule in &self.rules {
+        self.decide_traced(host, port, Layer::Instance).action
+    }
+
+    /// [`decide`](Self::decide) with provenance: which rule (or the default)
+    /// of this ruleset produced the verdict, attributed to `layer`.
+    fn decide_traced(&self, host: &str, port: u16, layer: Layer) -> Decision {
+        for (i, rule) in self.rules.iter().enumerate() {
             if host_matches(rule.pattern(), host, port) {
-                return rule.action();
+                return Decision {
+                    action: rule.action(),
+                    layer,
+                    rule: Some(i),
+                };
             }
         }
-        self.default
+        Decision {
+            action: self.default,
+            layer,
+            rule: None,
+        }
     }
 
     /// True when the ruleset admits everything (no rules, `default: allow`) — an
@@ -191,6 +236,28 @@ impl FilterRules {
     /// a filter of its own.
     pub fn is_noop(&self) -> bool {
         self.rules.is_empty() && self.default == Action::Allow
+    }
+
+    /// Cheap identity of this ruleset's *content*, used to key per-rule hit
+    /// counters: when the rules are replaced (admin PUT/DELETE, file reload),
+    /// the fingerprint changes and stale counters reset on their own — no
+    /// reset plumbing through the mutation paths.
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.default == Action::Deny).hash(&mut h);
+        self.log_only.hash(&mut h);
+        for rule in &self.rules {
+            (rule.action() == Action::Deny).hash(&mut h);
+            rule.pattern().hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// The pattern of rule `i`, for log/trace attribution. `None` when out of
+    /// range (a racy counter read against fresher rules — harmless).
+    pub fn rule_pattern(&self, i: usize) -> Option<&str> {
+        self.rules.get(i).map(|r| r.pattern())
     }
 }
 
@@ -211,28 +278,40 @@ impl FilterRules {
 ///   3. otherwise (the additive case) fall through to the file `floor` (its
 ///      rules, then its default). A silo that sets no filter of its own is
 ///      therefore governed entirely by the file floor.
+///
+/// The returned [`Decision`] carries provenance (layer + rule index) so the
+/// caller can attribute hit counters, name the rule in logs, and resolve which
+/// ruleset's `log_only` flag governs a deny.
 pub fn decide_session(
     instance: &FilterRules,
     silo: Option<&FilterRules>,
     floor: &FilterRules,
     host: &str,
     port: u16,
-) -> Action {
+) -> Decision {
     let Some(silo) = silo else {
-        return instance.decide(host, port);
+        return instance.decide_traced(host, port, Layer::Instance);
     };
     // (1) The silo's own rules win where they match — additive on top of the floor.
-    for rule in &silo.rules {
+    for (i, rule) in silo.rules.iter().enumerate() {
         if host_matches(rule.pattern(), host, port) {
-            return rule.action();
+            return Decision {
+                action: rule.action(),
+                layer: Layer::Silo,
+                rule: Some(i),
+            };
         }
     }
     // (2) A silo that opted into allowlist mode is closed; the floor can't reopen it.
     if silo.default == Action::Deny {
-        return Action::Deny;
+        return Decision {
+            action: Action::Deny,
+            layer: Layer::Silo,
+            rule: None,
+        };
     }
     // (3) Additive silo → the static file floor governs the rest.
-    floor.decide(host, port)
+    floor.decide_traced(host, port, Layer::Floor)
 }
 
 /// Does `pattern` match the target `host:port`?
@@ -443,7 +522,11 @@ rules:
     // --- decide (single ruleset) ---------------------------------------------
 
     fn rules(default: Action, rules: Vec<Rule>) -> FilterRules {
-        FilterRules { default, rules }
+        FilterRules {
+            default,
+            rules,
+            log_only: false,
+        }
     }
 
     #[test]
@@ -503,11 +586,11 @@ rules:
         let instance = rules(Action::Allow, vec![deny("bad.example")]);
         let floor = FilterRules::default();
         assert_eq!(
-            decide_session(&instance, None, &floor, "bad.example", 443),
+            decide_session(&instance, None, &floor, "bad.example", 443).action,
             Action::Deny
         );
         assert_eq!(
-            decide_session(&instance, None, &floor, "ok.example", 443),
+            decide_session(&instance, None, &floor, "ok.example", 443).action,
             Action::Allow
         );
     }
@@ -523,17 +606,17 @@ rules:
 
         // the silo's own deny applies
         assert_eq!(
-            decide_session(&instance, Some(&silo), &floor, "module.specific", 443),
+            decide_session(&instance, Some(&silo), &floor, "module.specific", 443).action,
             Action::Deny
         );
         // the file floor still applies where the silo is silent (compose, not replace)
         assert_eq!(
-            decide_session(&instance, Some(&silo), &floor, "tracker.shared", 443),
+            decide_session(&instance, Some(&silo), &floor, "tracker.shared", 443).action,
             Action::Deny
         );
         // a host neither blocks → allowed
         assert_eq!(
-            decide_session(&instance, Some(&silo), &floor, "fine.example", 443),
+            decide_session(&instance, Some(&silo), &floor, "fine.example", 443).action,
             Action::Allow
         );
         // the API-mutable instance layer never reaches a silo session
@@ -544,7 +627,8 @@ rules:
                 &floor,
                 "via-noBearer-api.example",
                 443
-            ),
+            )
+            .action,
             Action::Allow
         );
     }
@@ -555,11 +639,11 @@ rules:
         let empty = FilterRules::default();
         let instance = FilterRules::default();
         assert_eq!(
-            decide_session(&instance, Some(&empty), &floor, "bad.example", 443),
+            decide_session(&instance, Some(&empty), &floor, "bad.example", 443).action,
             Action::Deny
         );
         assert_eq!(
-            decide_session(&instance, Some(&empty), &floor, "ok.example", 443),
+            decide_session(&instance, Some(&empty), &floor, "ok.example", 443).action,
             Action::Allow
         );
     }
@@ -572,12 +656,12 @@ rules:
         let instance = FilterRules::default();
         // the silo's allow wins (evaluated first)
         assert_eq!(
-            decide_session(&instance, Some(&silo), &floor, "img.cdn.example", 443),
+            decide_session(&instance, Some(&silo), &floor, "img.cdn.example", 443).action,
             Action::Allow
         );
         // a sibling the silo didn't re-allow still hits the floor deny
         assert_eq!(
-            decide_session(&instance, Some(&silo), &floor, "js.cdn.example", 443),
+            decide_session(&instance, Some(&silo), &floor, "js.cdn.example", 443).action,
             Action::Deny
         );
     }
@@ -590,18 +674,83 @@ rules:
         let silo = rules(Action::Deny, vec![allow("api.target")]);
         let instance = FilterRules::default();
         assert_eq!(
-            decide_session(&instance, Some(&silo), &floor, "api.target", 443),
+            decide_session(&instance, Some(&silo), &floor, "api.target", 443).action,
             Action::Allow
         );
         // floor's allow does NOT leak into a closed-allowlist silo
         assert_eq!(
-            decide_session(&instance, Some(&silo), &floor, "floor-allows.example", 443),
+            decide_session(&instance, Some(&silo), &floor, "floor-allows.example", 443).action,
             Action::Deny
         );
         assert_eq!(
-            decide_session(&instance, Some(&silo), &floor, "anything.else", 443),
+            decide_session(&instance, Some(&silo), &floor, "anything.else", 443).action,
             Action::Deny
         );
+    }
+
+    // --- verdict attribution (layer + rule index) ------------------------------
+
+    #[test]
+    fn decision_attributes_the_matching_rule_and_layer() {
+        let instance = rules(
+            Action::Allow,
+            vec![allow("ok.example"), deny("bad.example")],
+        );
+        let floor = rules(Action::Allow, vec![deny("floor.example")]);
+
+        // Non-silo: instance rules by index, instance default when none match.
+        let d = decide_session(&instance, None, &floor, "bad.example", 443);
+        assert_eq!((d.layer, d.rule), (Layer::Instance, Some(1)));
+        let d = decide_session(&instance, None, &floor, "other.example", 443);
+        assert_eq!((d.layer, d.rule), (Layer::Instance, None));
+
+        // Silo session: silo rule, silo closed-allowlist default, floor rule,
+        // floor default — each attributed to its layer.
+        let silo = rules(Action::Allow, vec![deny("silo.example")]);
+        let d = decide_session(&instance, Some(&silo), &floor, "silo.example", 443);
+        assert_eq!((d.layer, d.rule), (Layer::Silo, Some(0)));
+        let d = decide_session(&instance, Some(&silo), &floor, "floor.example", 443);
+        assert_eq!((d.layer, d.rule), (Layer::Floor, Some(0)));
+        let d = decide_session(&instance, Some(&silo), &floor, "free.example", 443);
+        assert_eq!((d.layer, d.rule), (Layer::Floor, None));
+
+        let closed = rules(Action::Deny, vec![allow("api.example")]);
+        let d = decide_session(&instance, Some(&closed), &floor, "elsewhere.example", 443);
+        assert_eq!(
+            (d.action, d.layer, d.rule),
+            (Action::Deny, Layer::Silo, None)
+        );
+    }
+
+    #[test]
+    fn fingerprint_tracks_ruleset_content() {
+        let a = rules(Action::Allow, vec![deny("x.example")]);
+        let mut b = a.clone();
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        b.rules.push(deny("y.example"));
+        assert_ne!(a.fingerprint(), b.fingerprint());
+        let mut c = a.clone();
+        c.log_only = true;
+        assert_ne!(a.fingerprint(), c.fingerprint());
+        let mut d = a.clone();
+        d.default = Action::Deny;
+        assert_ne!(a.fingerprint(), d.fingerprint());
+    }
+
+    #[test]
+    fn log_only_defaults_false_and_roundtrips() {
+        // Absent in old configs/snapshots → false (previous behaviour).
+        let f: FilterRules = serde_yaml::from_str("default: allow\n").unwrap();
+        assert!(!f.log_only);
+        // Set → parses and survives a serialize/deserialize roundtrip.
+        let f: FilterRules = serde_yaml::from_str("default: deny\nlog_only: true\n").unwrap();
+        assert!(f.log_only);
+        let json = serde_json::to_string(&f).unwrap();
+        let back: FilterRules = serde_json::from_str(&json).unwrap();
+        assert!(back.log_only);
+        // false is skipped on the wire (old snapshot byte-shape preserved).
+        let f = FilterRules::default();
+        assert!(!serde_json::to_string(&f).unwrap().contains("log_only"));
     }
 
     // --- serde wire shape ----------------------------------------------------

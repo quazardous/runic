@@ -298,18 +298,53 @@ async fn serve(
     // non-silo session obeys the merged instance filter; a silo session composes
     // its own filter on top of the static file floor (`cfg.silo_floor_filter`) —
     // the admin-API runtime/permanent layers never reach a silo.
-    if filter::decide_session(
+    let decision = filter::decide_session(
         &cfg.filter,
         silo_filter.as_ref(),
         &cfg.silo_floor_filter,
         &host,
         port,
-    ) == Action::Deny
-    {
-        stats.record_filtered(variation_id.as_deref());
-        warn!(%host, port, "CONNECT denied by domain filter");
-        reply(&mut client, REPLY_CONN_NOT_ALLOWED).await?;
-        return Ok(());
+    );
+    // The ruleset the verdict came from: it owns the hit counter and, on a
+    // deny, its `log_only` flag decides enforce vs dry-run.
+    let deciding = match decision.layer {
+        filter::Layer::Instance => &cfg.filter,
+        filter::Layer::Floor => &cfg.silo_floor_filter,
+        filter::Layer::Silo => silo_filter
+            .as_ref()
+            .expect("a silo-layer verdict implies a silo filter"),
+    };
+    // Every verdict (allow AND deny) feeds the per-rule hit counters —
+    // debugging an allowlist needs to see which `allow` fires, not just denies.
+    stats.record_filter_hit(
+        decision.layer,
+        variation_id.as_deref(),
+        deciding.fingerprint(),
+        decision.rule,
+    );
+    if decision.action == Action::Deny {
+        let rule = decision
+            .rule
+            .and_then(|i| deciding.rule_pattern(i))
+            .unwrap_or("(default)");
+        if deciding.log_only {
+            // Dry-run: count + log the would-be deny, then let it through.
+            stats.record_would_filtered(variation_id.as_deref());
+            info!(
+                %host, port, layer = ?decision.layer, rule,
+                variation = variation_id.as_deref().unwrap_or(""),
+                "CONNECT would be denied by domain filter (log_only)"
+            );
+        } else {
+            stats.record_filtered(variation_id.as_deref());
+            warn!(
+                %host, port, layer = ?decision.layer, rule,
+                variation = variation_id.as_deref().unwrap_or(""),
+                "CONNECT denied by domain filter"
+            );
+            reply(&mut client, REPLY_CONN_NOT_ALLOWED).await?;
+            return Ok(());
+        }
     }
 
     // Live counters for the status surface: mark this session active for its
@@ -937,6 +972,7 @@ mod tests {
         cfg.filter = FilterRules {
             default: Action::Allow,
             rules: vec![Rule::Deny("blocked.example".into())],
+            log_only: false,
         };
         let (_tx, rx) = watch::channel(Arc::new(cfg));
 
@@ -981,6 +1017,7 @@ mod tests {
         cfg.filter = FilterRules {
             default: Action::Allow,
             rules: vec![Rule::Deny("[2001:0db8:0:0:0:0:0:99]".into())],
+            log_only: false,
         };
         let (_tx, rx) = watch::channel(Arc::new(cfg));
 
@@ -1007,6 +1044,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(code, 0x00, "non-denied IPv6 target should connect");
+    }
+
+    #[tokio::test]
+    async fn e2e_log_only_lets_denied_connect_through_and_counts_it() {
+        use crate::filter::{Action, FilterRules, Layer, Rule};
+
+        let upstream_addr = spawn_mock_upstream(MockBehavior::Echo, "u", "p").await;
+        let listen_addr = pick_free_port();
+        let mut cfg = cfg_for(listen_addr, upstream_addr, "u", "p");
+        // A strict allowlist in dry-run: everything not allowed WOULD be
+        // denied, but log_only lets it through while counting.
+        cfg.filter = FilterRules {
+            default: Action::Deny,
+            rules: vec![Rule::Allow("api.target.example".into())],
+            log_only: true,
+        };
+        let fp = cfg.filter.fingerprint();
+        let (_tx, rx) = watch::channel(Arc::new(cfg));
+
+        let stats = Stats::new();
+        let server_stats = stats.clone();
+        tokio::spawn(async move {
+            let _ = run(rx, None, server_stats).await;
+        });
+        wait_until_listening(listen_addr).await;
+
+        // Not on the allowlist → would-deny, but the tunnel opens and works.
+        let mut tunnel = socks5_connect(listen_addr, "not.allowed.example", 443)
+            .await
+            .expect("log_only must let the would-denied CONNECT through");
+        let echoed = echo_roundtrip(&mut tunnel, b"dry-run-payload")
+            .await
+            .unwrap();
+        assert_eq!(echoed, b"dry-run-payload");
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.would_filtered_total, 1);
+        assert_eq!(snap.filtered_total, 0, "nothing actually refused");
+        assert_eq!(snap.requests_total, 1, "the session really began");
+        // The would-deny came from the instance default (allowlist mode).
+        let hits = stats.filter_hits(Layer::Instance, None, fp);
+        assert_eq!(hits.default_hits, 1);
+
+        // An allowed host passes and its allow rule takes the hit.
+        let _t2 = socks5_connect(listen_addr, "api.target.example", 443)
+            .await
+            .expect("allowlisted host connects");
+        let hits = stats.filter_hits(Layer::Instance, None, fp);
+        assert_eq!(hits.rules, vec![1], "the allow rule's hit is attributed");
+        assert_eq!(
+            stats.snapshot().would_filtered_total,
+            1,
+            "allow is not a would-deny"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_enforced_deny_attributes_the_rule_hit() {
+        use crate::filter::{Action, FilterRules, Layer, Rule};
+
+        let upstream_addr = spawn_mock_upstream(MockBehavior::Echo, "u", "p").await;
+        let listen_addr = pick_free_port();
+        let mut cfg = cfg_for(listen_addr, upstream_addr, "u", "p");
+        cfg.filter = FilterRules {
+            default: Action::Allow,
+            rules: vec![Rule::Deny("blocked.example".into())],
+            log_only: false,
+        };
+        let fp = cfg.filter.fingerprint();
+        let (_tx, rx) = watch::channel(Arc::new(cfg));
+
+        let stats = Stats::new();
+        let server_stats = stats.clone();
+        tokio::spawn(async move {
+            let _ = run(rx, None, server_stats).await;
+        });
+        wait_until_listening(listen_addr).await;
+
+        let code = socks5_connect_capture_code(listen_addr, "blocked.example", 443)
+            .await
+            .unwrap();
+        assert_eq!(code, 0x02);
+        let hits = stats.filter_hits(Layer::Instance, None, fp);
+        assert_eq!(hits.rules, vec![1], "the deny rule took the hit");
+        assert_eq!(hits.default_hits, 0);
+        assert_eq!(
+            stats.snapshot().would_filtered_total,
+            0,
+            "enforced ≠ dry-run"
+        );
     }
 
     #[tokio::test]
@@ -1340,6 +1467,7 @@ mod tests {
                     filter: FilterRules {
                         default: Action::Allow,
                         rules: vec![Rule::Deny("silo-blocked.example".into())],
+                        log_only: false,
                     },
                 },
                 0,
@@ -1361,11 +1489,13 @@ mod tests {
             filter: FilterRules {
                 default: Action::Allow,
                 rules: vec![Rule::Deny("instance-only.example".into())],
+                log_only: false,
             },
             // The static file floor blocks a host — it MUST compose under the silo.
             silo_floor_filter: FilterRules {
                 default: Action::Allow,
                 rules: vec![Rule::Deny("floor-blocked.example".into())],
+                log_only: false,
             },
         };
         let (_tx, rx) = watch::channel(Arc::new(cfg));
@@ -1479,6 +1609,7 @@ mod tests {
         store.lock().await.set_filter_runtime(FilterRules {
             default: Action::Allow,
             rules: vec![Rule::Deny("runtime-only.example".into())],
+            log_only: false,
         });
 
         crate::watcher::spawn(yaml_path.clone(), store.clone()).expect("spawn watcher");

@@ -103,10 +103,50 @@ effective filter is `runtime ▷ permanent ▷ cold YAML`, mirroring the upstrea
 layers. Changes apply live: in-flight sessions keep their decision, new sessions
 use the latest rules.
 
+### Per-rule hit counters
+
+`GET /v1/filter` decorates every rule with a `hits` counter, plus a top-level
+`default_hits` for verdicts the `default` action decided — so you can see
+*which* rule fires (allow **and** deny hits both count; debugging an allowlist
+needs to see which `allow` passes traffic):
+
+```json
+{"default":"allow","log_only":false,
+ "rules":[{"deny":"*.doubleclick.net","hits":42}],
+ "default_hits":1307}
+```
+
+The counters are RAM-only debug state: they reset whenever the ruleset is
+replaced (a `PUT`/`DELETE`, a config-file reload) and on restart. In silo mode
+the Bearer `GET` shows the same decoration for that variation's own rules
+(ephemeral, warm-only — nothing enters the encrypted blob).
+
+### Dry-run: `log_only`
+
+Set `log_only: true` on a ruleset (YAML `filter:` block or the API body) and
+its `deny` verdicts are **logged and counted but let through** — the
+firewalld-style way to validate a strict allowlist under real traffic before
+enforcing it:
+
+```sh
+curl -s -X PUT http://127.0.0.1:48484/v1/filter \
+  -d '{"default":"deny","log_only":true,"rules":[{"allow":"api.target.com"}]}'
+# watch what WOULD break:
+curl -s http://127.0.0.1:48484/v1/status | grep would_filtered_total
+# then enforce by re-PUTting without log_only
+```
+
+Would-be denies land in `would_filtered_total` (`filtered_total` stays
+untouched — nothing was refused), in the per-rule hit counters, and in the log
+(one structured line per would-deny, naming the host, port, layer and rule).
+The flag belongs to each ruleset: a silo can dry-run its own filter while the
+instance enforces, and vice versa. The file floor honours it too.
+
 The status page (open the admin port in a browser) shows the filter posture —
-`blocklist · N rules` / `allowlist · N rules` / `off` — and a cumulative
-**Filtered** counter of refused CONNECTs. The same data is in `GET /v1/status`
-(`filter` object + `filtered_total`).
+`blocklist · N rules` / `allowlist · N rules · log-only` / `off` — and a
+cumulative **Filtered** counter of refused CONNECTs (with the dry-run count
+alongside when log_only traffic exists). The same data is in `GET /v1/status`
+(`filter` object + `filtered_total` + `would_filtered_total`).
 
 ## In silo mode
 

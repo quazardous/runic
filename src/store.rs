@@ -572,6 +572,7 @@ mod tests {
         store.set_filter_runtime(FilterRules {
             default: Action::Allow,
             rules: vec![Rule::Deny("runtime.example".into())],
+            log_only: false,
         });
         assert_eq!(store.merged().filter.rules.len(), 1);
         // The runtime override governs the merged (non-silo) filter, but NOT the
@@ -583,6 +584,7 @@ mod tests {
             .set_filter_permanent(FilterRules {
                 default: Action::Deny,
                 rules: vec![Rule::Allow("api.example".into())],
+                log_only: false,
             })
             .unwrap();
 

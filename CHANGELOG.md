@@ -15,6 +15,28 @@ humans, not machines"), and the project follows
 
 ### Added
 
+- **Per-rule hit counters on the domain filter.** `GET /v1/filter` now
+  decorates every rule with `hits: N` (plus `default_hits` for verdicts the
+  `default` action decided) — allow and deny hits both count, so you can see
+  which rule actually fires instead of debugging a ruleset blind. RAM-only
+  debug state: counters reset when the rules are replaced (admin `PUT`/
+  `DELETE`, config reload) and on restart. In silo mode the Bearer `GET`
+  shows the same for that variation's own rules (ephemeral, warm-only —
+  nothing enters the encrypted blob). Every enforced deny (and dry-run
+  would-deny) also emits one structured log line naming the host, port,
+  layer and rule.
+
+- **`log_only: true` — dry-run the filter (firewalld-style).** A ruleset with
+  the flag evaluates as usual, but its `deny` verdicts are logged and counted
+  instead of enforced — the way to validate a strict allowlist under real
+  traffic before flipping it on. Would-be denies land in the new
+  `would_filtered_total` status counter (`filtered_total` stays untouched —
+  nothing was refused) and per variation; the status page shows the
+  `log-only` posture next to the filter mode and the dry-run count next to
+  **Filtered**. The flag belongs to each ruleset (instance, silo, file floor)
+  independently; absent = enforce, so existing configs and snapshots behave
+  exactly as before.
+
 - **The domain filter accepts IPv6 literals, in the standard bracket form.**
   `deny: "[2001:db8::1]"` (and `"[2001:db8::1]:443"` with a port constraint)
   now filters CONNECTs to that address. Matching is at the **address level**:
