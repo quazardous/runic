@@ -209,17 +209,32 @@ async fn route(
         }
         ("GET", "/v1/filter") => {
             // Silo mode + Bearer ⇒ that variation's own filter; otherwise the
-            // effective global filter (hot ▷ snapshot ▷ cold).
+            // effective global filter (hot ▷ snapshot ▷ cold). Either way the
+            // rules come back decorated with their RAM hit counters.
             if let (Some(silo), Some(token)) = (silo.as_ref(), req.bearer.as_ref()) {
+                let variation = crate::silo::VariationCache::id_of(token);
                 return match silo.cache.lock().await.access(token, unix_now()) {
-                    Ok(data) => json_response(200, "OK", &json!(data.filter)),
+                    Ok(data) => json_response(
+                        200,
+                        "OK",
+                        &filter_with_hits(
+                            &data.filter,
+                            stats,
+                            crate::filter::Layer::Silo,
+                            variation.as_deref(),
+                        ),
+                    ),
                     Err(_) => {
                         json_response(404, "Not Found", &json!({ "code": "silo_token_unknown" }))
                     }
                 };
             }
             let filter = store.lock().await.effective_filter();
-            json_response(200, "OK", &json!(filter))
+            json_response(
+                200,
+                "OK",
+                &filter_with_hits(&filter, stats, crate::filter::Layer::Instance, None),
+            )
         }
         ("PUT", "/v1/filter") => {
             let filter: FilterRules = match serde_json::from_slice(&req.body) {
@@ -597,6 +612,9 @@ async fn status_response(
         "active": !filter.is_noop(),
         "default": filter.default,
         "rules": filter.rules.len(),
+        // Dry-run posture: denies from this ruleset are logged/counted but
+        // let through (see `would_filtered_total`).
+        "log_only": filter.log_only,
         "silo_floor_rules": merged.silo_floor_filter.rules.len(),
     });
 
@@ -637,6 +655,7 @@ async fn status_response(
                         "connections": vs.active,
                         "requests": vs.requests,
                         "filtered": vs.filtered,
+                        "would_filtered": vs.would_filtered,
                         "last_access_secs": idle,
                         "ttl_secs_remaining": ttl.saturating_sub(idle),
                     })
@@ -678,11 +697,44 @@ async fn status_response(
             "requests_total": snap.requests_total,
             // Cumulative CONNECTs refused by the domain filter.
             "filtered_total": snap.filtered_total,
+            // Cumulative CONNECTs a log_only ruleset WOULD have denied (they
+            // went through — dry-run accounting only).
+            "would_filtered_total": snap.would_filtered_total,
             "filter": filter_json,
             "upstreams_hot": upstreams_hot,
             "silo": silo_json,
         }),
     )
+}
+
+/// Serialize a ruleset for `GET /v1/filter`, decorated with its RAM hit
+/// counters: `hits: N` on each rule plus a top-level `default_hits`, and
+/// `log_only` always present (the struct skips serializing it when false).
+/// All zeroes right after the rules were replaced — the counters are keyed by
+/// the ruleset's content fingerprint, so stale hits never mislabel new rules.
+fn filter_with_hits(
+    filter: &crate::filter::FilterRules,
+    stats: &Arc<Stats>,
+    layer: crate::filter::Layer,
+    variation: Option<&str>,
+) -> serde_json::Value {
+    let hits = stats.filter_hits(layer, variation, filter.fingerprint());
+    let mut v = serde_json::to_value(filter).expect("filter serializes");
+    if let Some(rules) = v.get_mut("rules").and_then(|r| r.as_array_mut()) {
+        for (i, rule) in rules.iter_mut().enumerate() {
+            if let Some(obj) = rule.as_object_mut() {
+                obj.insert(
+                    "hits".into(),
+                    json!(hits.rules.get(i).copied().unwrap_or(0)),
+                );
+            }
+        }
+    }
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("default_hits".into(), json!(hits.default_hits));
+        obj.entry("log_only").or_insert(json!(false));
+    }
+    v
 }
 
 /// The no-hint ("default") route's `(name, kind)` for a config — mirrors
@@ -1068,6 +1120,61 @@ mod tests {
         )
         .await;
         assert_eq!(code, 400);
+    }
+
+    #[tokio::test]
+    async fn filter_get_is_decorated_with_hits_and_log_only() {
+        let (addr, _dir) = test_server().await;
+
+        // PUT a log_only allowlist, then read it back: every rule carries a
+        // `hits` counter (0 — no traffic in this test), plus `default_hits`
+        // and the explicit `log_only` posture.
+        let put_body = r#"{"default":"deny","log_only":true,"rules":[{"allow":"api.ok.com"}]}"#;
+        let (code, _b) = http(
+            addr,
+            &format!(
+                "PUT /v1/filter HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{put_body}",
+                put_body.len()
+            ),
+        )
+        .await;
+        assert_eq!(code, 200);
+
+        let (code, body) = http(
+            addr,
+            "GET /v1/filter HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(code, 200);
+        assert!(body.contains("\"hits\":0"), "got: {body}");
+        assert!(body.contains("\"default_hits\":0"), "got: {body}");
+        assert!(body.contains("\"log_only\":true"), "got: {body}");
+
+        // The status surface shows the dry-run posture and counter.
+        let (_c, sbody) = http(
+            addr,
+            "GET /v1/status HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(sbody.contains("\"log_only\":true"), "got: {sbody}");
+        assert!(sbody.contains("\"would_filtered_total\":0"), "got: {sbody}");
+
+        // A filter without the flag reads back log_only:false (explicit).
+        let put_body = r#"{"default":"allow","rules":[{"deny":"x.com"}]}"#;
+        let (_c, _b) = http(
+            addr,
+            &format!(
+                "PUT /v1/filter HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{put_body}",
+                put_body.len()
+            ),
+        )
+        .await;
+        let (_c, body) = http(
+            addr,
+            "GET /v1/filter HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(body.contains("\"log_only\":false"), "got: {body}");
     }
 
     #[tokio::test]

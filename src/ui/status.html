@@ -127,10 +127,14 @@ function paint(d) {
     : '<span class="none">none</span>';
   el("sessions").textContent = d.active_sessions;
   el("requests").textContent = d.requests_total;
-  el("filtered").textContent = d.filtered_total != null ? d.filtered_total : "—";
+  // In log_only (dry-run) mode nothing is actually refused: show the would-be
+  // count alongside so the counter still tells the filter story.
+  el("filtered").textContent = (d.filtered_total != null ? d.filtered_total : "—")
+    + (d.would_filtered_total ? " (+" + d.would_filtered_total + " dry-run)" : "");
   // Show the filter posture under the counter: e.g. "blocklist · 12 rules",
-  // "allowlist · 3 rules", or "off" when nothing is configured. A file-level
-  // silo floor (composed under every silo's own filter) is noted when present.
+  // "allowlist · 3 rules · log-only", or "off" when nothing is configured. A
+  // file-level silo floor (composed under every silo's own filter) is noted
+  // when present.
   var f = d.filter, fm = el("filter-mode");
   if (f && (f.active || f.silo_floor_rules)) {
     var parts = [];
@@ -138,6 +142,7 @@ function paint(d) {
       var mode = f.default === "deny" ? "allowlist" : "blocklist";
       parts.push(mode + " · " + f.rules + (f.rules === 1 ? " rule" : " rules"));
     }
+    if (f.log_only) parts.push("log-only");
     if (f.silo_floor_rules) parts.push("silo floor · " + f.silo_floor_rules);
     fm.textContent = parts.join(" · ");
   } else {
