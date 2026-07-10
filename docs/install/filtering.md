@@ -59,11 +59,20 @@ by ruleset") — a clean rejection, and no proxy quota is spent on the blocked h
 | `example.com:443`    | `example.com`, but only on port 443                  |
 | `*.cdn.net:443`      | any `*.cdn.net` subdomain on port 443                |
 | `203.0.113.4`        | that IPv4 literal, exactly                           |
+| `[2001:db8::1]`      | that IPv6 literal — any spelling of it (address-level match) |
+| `[2001:db8::1]:443`  | the same, but only on port 443                       |
 
 Matching is ASCII-case-insensitive. A `:port` suffix restricts the rule to that
-port; without it the rule matches on any port. Bracketless IPv6 literals are not
-supported as patterns (the `:` reads as a port separator) — filter IPv6 targets
-by an enclosing hostname.
+port; without it the rule matches on any port.
+
+IPv6 literals use the standard bracket form (RFC 3986) so the `:port` suffix
+stays unambiguous, and they match at the **address level**: `[2001:0db8::0001]`
+matches a CONNECT to `2001:db8::1` whatever the spelling. A **bare** IPv6
+pattern (`2001:db8::1`, no brackets) is rejected when the rules load — config
+file at boot/reload, `PUT /v1/filter` with a 400 — because its trailing `:1`
+would silently read as a port constraint and the rule would never match
+anything. Wildcards don't apply to address literals (an address has no
+subdomains).
 
 ## Managing it at runtime — the admin API
 

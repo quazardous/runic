@@ -763,7 +763,7 @@ mod tests {
     };
     use crate::test_helpers::{
         echo_roundtrip, pick_free_port, socks5_connect, socks5_connect_capture_code,
-        spawn_mock_upstream, MockBehavior,
+        socks5_connect_ipv6_capture_code, spawn_mock_upstream, MockBehavior,
     };
     use std::collections::BTreeMap;
     use std::time::Duration;
@@ -966,6 +966,47 @@ mod tests {
             .unwrap();
         assert_eq!(code, 0x00, "non-blocked host should connect");
         assert_eq!(stats.snapshot().requests_total, 1);
+    }
+
+    #[tokio::test]
+    async fn e2e_filter_denies_ipv6_target_via_bracketed_rule() {
+        use crate::filter::{Action, FilterRules, Rule};
+        use std::net::Ipv6Addr;
+
+        let upstream_addr = spawn_mock_upstream(MockBehavior::Echo, "u", "p").await;
+        let listen_addr = pick_free_port();
+        let mut cfg = cfg_for(listen_addr, upstream_addr, "u", "p");
+        // Bracketed rule in a NON-canonical spelling: the match must be at the
+        // address level, not string equality.
+        cfg.filter = FilterRules {
+            default: Action::Allow,
+            rules: vec![Rule::Deny("[2001:0db8:0:0:0:0:0:99]".into())],
+        };
+        let (_tx, rx) = watch::channel(Arc::new(cfg));
+
+        let stats = Stats::new();
+        let server_stats = stats.clone();
+        tokio::spawn(async move {
+            let _ = run(rx, None, server_stats).await;
+        });
+        wait_until_listening(listen_addr).await;
+
+        // ATYP=IPv6 CONNECT to the denied address → 0x02, no session begins.
+        let denied: Ipv6Addr = "2001:db8::99".parse().unwrap();
+        let code = socks5_connect_ipv6_capture_code(listen_addr, denied, 443)
+            .await
+            .unwrap();
+        assert_eq!(code, 0x02, "denied IPv6 literal must get reply 0x02");
+        let snap = stats.snapshot();
+        assert_eq!(snap.filtered_total, 1);
+        assert_eq!(snap.requests_total, 0);
+
+        // A sibling address is not caught by the literal rule.
+        let other: Ipv6Addr = "2001:db8::98".parse().unwrap();
+        let code = socks5_connect_ipv6_capture_code(listen_addr, other, 443)
+            .await
+            .unwrap();
+        assert_eq!(code, 0x00, "non-denied IPv6 target should connect");
     }
 
     #[tokio::test]

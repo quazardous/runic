@@ -11,6 +11,24 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+### Added
+
+- **The domain filter accepts IPv6 literals, in the standard bracket form.**
+  `deny: "[2001:db8::1]"` (and `"[2001:db8::1]:443"` with a port constraint)
+  now filters CONNECTs to that address. Matching is at the **address level**:
+  any valid spelling of the pattern matches any spelling of the target —
+  `[2001:0db8::0001]` blocks `2001:db8::1`. Wildcards don't apply to literals.
+
+### Fixed
+
+- **A bare IPv6 pattern is now rejected loudly instead of silently matching
+  nothing.** Previously `deny: "2001:db8::1"` was misparsed — the trailing
+  `:1` read as a port constraint — and the rule never matched, with no error
+  or warning. Such patterns (and other bracketless colon-in-host shapes) are
+  now refused when the rules load: at boot / hot reload for the config file,
+  with a 400 for `PUT /v1/filter` — the error message points at the bracket
+  form to use.
+
 ## [0.10.0] - 2026-07-10
 
 ### Changed

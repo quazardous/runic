@@ -216,6 +216,30 @@ pub async fn socks5_connect_capture_code(
     Ok(conn_reply[1])
 }
 
+/// Like [`socks5_connect_capture_code`] but sends the target as ATYP=IPv6
+/// (0x04, 16 raw bytes) instead of a domain — exercising the address-literal
+/// path end to end (e.g. against a bracketed-IPv6 filter rule).
+pub async fn socks5_connect_ipv6_capture_code(
+    local_addr: SocketAddr,
+    target: std::net::Ipv6Addr,
+    target_port: u16,
+) -> Result<u8> {
+    let mut sock = TcpStream::connect(local_addr).await?;
+    sock.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut greeting_reply = [0u8; 2];
+    sock.read_exact(&mut greeting_reply).await?;
+    if greeting_reply[1] != 0x00 {
+        return Ok(greeting_reply[1]);
+    }
+    let mut req = vec![0x05, 0x01, 0x00, 0x04];
+    req.extend_from_slice(&target.octets());
+    req.extend_from_slice(&target_port.to_be_bytes());
+    sock.write_all(&req).await?;
+    let mut conn_reply = [0u8; 10];
+    sock.read_exact(&mut conn_reply).await?;
+    Ok(conn_reply[1])
+}
+
 /// Convenience: copy `payload` through `tunnel`, read the same number of bytes
 /// back, and assert byte-equality. Returns the echoed bytes so the caller can
 /// inspect further.
@@ -233,6 +257,7 @@ pub async fn echo_roundtrip(tunnel: &mut TcpStream, payload: &[u8]) -> Result<Ve
 const _: fn() = || {
     let _ = echo_roundtrip;
     let _ = socks5_connect_capture_code;
+    let _ = socks5_connect_ipv6_capture_code;
     let _ = socks5_connect;
     let _ = socks5_connect_with_userpass;
 };
