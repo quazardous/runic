@@ -1071,6 +1071,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filter_rejects_bare_ipv6_pattern_with_400() {
+        // A bare IPv6 literal would silently misparse (trailing `:<n>` read as
+        // a port) — the API must refuse it loudly and point at the bracket form.
+        let (addr, _dir) = test_server().await;
+        let bad = r#"{"rules":[{"deny":"2001:db8::1"}]}"#;
+        let (code, body) = http(
+            addr,
+            &format!(
+                "PUT /v1/filter HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{bad}",
+                bad.len()
+            ),
+        )
+        .await;
+        assert_eq!(code, 400);
+        assert!(body.contains("[2001:db8::1]"), "got: {body}");
+
+        // The bracketed form is accepted.
+        let good = r#"{"rules":[{"deny":"[2001:db8::1]"}]}"#;
+        let (code, _b) = http(
+            addr,
+            &format!(
+                "PUT /v1/filter HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{good}",
+                good.len()
+            ),
+        )
+        .await;
+        assert_eq!(code, 200);
+    }
+
+    #[tokio::test]
     async fn serves_self_contained_html_status_page() {
         let (addr, _dir) = test_server().await;
         let mut sock = TcpStream::connect(addr).await.unwrap();

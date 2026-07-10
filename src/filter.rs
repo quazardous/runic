@@ -17,6 +17,8 @@
 //! iptables chains; blocking by hostname follows the spirit of adblock hostlists
 //! (runic ships no bundled list — you declare your own rules).
 
+use std::net::Ipv6Addr;
+
 use serde::{Deserialize, Serialize};
 
 /// The verdict for a target: let the CONNECT through, or refuse it.
@@ -55,12 +57,77 @@ impl TryFrom<RuleWire> for Rule {
 
     fn try_from(w: RuleWire) -> Result<Self, Self::Error> {
         match (w.allow, w.deny) {
-            (Some(p), None) => Ok(Rule::Allow(p)),
-            (None, Some(p)) => Ok(Rule::Deny(p)),
+            (Some(p), None) => {
+                validate_pattern(&p)?;
+                Ok(Rule::Allow(p))
+            }
+            (None, Some(p)) => {
+                validate_pattern(&p)?;
+                Ok(Rule::Deny(p))
+            }
             (Some(_), Some(_)) => {
                 Err("a filter rule sets both `allow` and `deny`; use exactly one".into())
             }
             (None, None) => Err("a filter rule sets neither `allow` nor `deny`".into()),
+        }
+    }
+}
+
+/// Validate a rule pattern at ingestion. Runs in the [`RuleWire`] conversion,
+/// the single deserialization chokepoint — so the cold YAML (boot + hot
+/// reload), the admin API (`PUT /v1/filter` → 400) and silo snapshots all get
+/// the same loud rejection instead of a rule that silently never matches.
+///
+/// Rejected shapes:
+/// - a bare IPv6 literal (`2001:db8::1`): its trailing `:<n>` would be read as
+///   a port constraint — the classic silent misparse. Write `[addr]` or
+///   `[addr]:port` (RFC 3986 bracket notation, zero ambiguity).
+/// - anything with a `:` in the host part outside brackets (e.g. a zone-id
+///   literal, or a mangled IPv6 spelling that doesn't parse): same ambiguity.
+/// - a malformed bracket form (`[not-ipv6]`, `[..]junk`, bad port).
+/// - a wildcard on a literal (`*.` next to brackets): wildcards are for
+///   domain names; an address has no subdomains.
+fn validate_pattern(p: &str) -> Result<(), String> {
+    if let Some(rest) = p.strip_prefix('[') {
+        // Bracketed IPv6 literal: [addr] or [addr]:port.
+        let Some((inner, after)) = rest.split_once(']') else {
+            return Err(format!(
+                "filter pattern '{p}': unclosed '[' — use [ipv6] or [ipv6]:port"
+            ));
+        };
+        if inner.parse::<Ipv6Addr>().is_err() {
+            return Err(format!(
+                "filter pattern '{p}': '{inner}' is not a valid IPv6 literal"
+            ));
+        }
+        match after {
+            "" => Ok(()),
+            _ => match after.strip_prefix(':').map(str::parse::<u16>) {
+                Some(Ok(_)) => Ok(()),
+                _ => Err(format!(
+                    "filter pattern '{p}': expected nothing or ':<port>' after ']', got '{after}'"
+                )),
+            },
+        }
+    } else if p.parse::<Ipv6Addr>().is_ok() {
+        Err(format!(
+            "filter pattern '{p}' is a bare IPv6 literal; a trailing ':<n>' would be read as a \
+             port constraint — write [{p}] or [{p}]:port instead"
+        ))
+    } else if p.contains('[') || p.contains(']') {
+        Err(format!(
+            "filter pattern '{p}': brackets are only valid as a leading [ipv6] literal \
+             (wildcards don't apply to addresses)"
+        ))
+    } else {
+        // A lone `host:port` colon is fine; a second colon in the host part is
+        // an IPv6-ish shape that didn't parse above — reject it rather than
+        // letting it match nothing.
+        match p.rsplit_once(':') {
+            Some((h, _)) if h.contains(':') => Err(format!(
+                "filter pattern '{p}' looks like an IPv6 literal — use [addr] or [addr]:port"
+            )),
+            _ => Ok(()),
         }
     }
 }
@@ -176,13 +243,34 @@ pub fn decide_session(
 /// `:port` suffix restricts the rule to that port; without it the rule matches
 /// on any port.
 ///
-/// IPv4 literals match exactly (`1.2.3.4`). Bracketless IPv6 literals are not
-/// supported as patterns (the `:` would be read as a port separator) — filter
-/// IPv6 targets by an enclosing hostname instead.
+/// IPv4 literals match exactly (`1.2.3.4` — Rust's parser only accepts the
+/// canonical spelling, so string equality is address equality). IPv6 literals
+/// use the RFC 3986 bracket form — `[2001:db8::1]` or `[2001:db8::1]:443` —
+/// and match at the *address* level: any valid spelling of the pattern matches
+/// any spelling of the target (a SOCKS5 ATYP=IPv6 target arrives canonical,
+/// but a domain-ATYP literal may not be). Bare (bracketless) IPv6 patterns are
+/// rejected at ingestion — see [`validate_pattern`].
 fn host_matches(pattern: &str, host: &str, port: u16) -> bool {
+    // Bracketed IPv6 literal pattern: [addr] or [addr]:port.
+    if let Some(rest) = pattern.strip_prefix('[') {
+        let Some((inner, after)) = rest.split_once(']') else {
+            return false;
+        };
+        let Ok(pat_ip) = inner.parse::<Ipv6Addr>() else {
+            return false;
+        };
+        match after.strip_prefix(':') {
+            Some(p) if p.parse::<u16>() != Ok(port) => return false,
+            Some(_) => {}
+            None if !after.is_empty() => return false,
+            None => {}
+        }
+        // Address-level compare; tolerate a bracketed spelling of the target.
+        return host.trim_start_matches('[').trim_end_matches(']').parse() == Ok(pat_ip);
+    }
     let (pat_host, pat_port) = match pattern.rsplit_once(':') {
-        // A trailing `:<digits>` is a port constraint; anything else (e.g. an
-        // IPv6 literal) is treated as a bare host pattern.
+        // A trailing `:<digits>` is a port constraint; anything else is
+        // treated as a bare host pattern.
         Some((h, p)) => match p.parse::<u16>() {
             Ok(pp) => (h, Some(pp)),
             Err(_) => (pattern, None),
@@ -269,6 +357,87 @@ mod tests {
     fn ipv4_literal_matches_exactly() {
         assert!(host_matches("203.0.113.4", "203.0.113.4", 443));
         assert!(!host_matches("203.0.113.4", "203.0.113.5", 443));
+    }
+
+    #[test]
+    fn bracketed_ipv6_matches_at_address_level() {
+        // A SOCKS5 ATYP=IPv6 target arrives as Ipv6Addr::to_string(): canonical,
+        // compressed, no brackets.
+        assert!(host_matches("[2001:db8::1]", "2001:db8::1", 443));
+        // Any spelling of the pattern matches the canonical target.
+        assert!(host_matches("[2001:0db8:0:0:0:0:0:1]", "2001:db8::1", 443));
+        assert!(host_matches("[2001:0DB8::0001]", "2001:db8::1", 443));
+        // A non-canonical target spelling (domain-ATYP literal) still matches.
+        assert!(host_matches("[2001:db8::1]", "2001:0db8::1", 443));
+        assert!(host_matches("[2001:db8::1]", "[2001:db8::1]", 443));
+        // Different address → no match.
+        assert!(!host_matches("[2001:db8::1]", "2001:db8::2", 443));
+        // A domain target never matches an address pattern.
+        assert!(!host_matches("[2001:db8::1]", "example.com", 443));
+    }
+
+    #[test]
+    fn bracketed_ipv6_port_constraint_is_honoured() {
+        assert!(host_matches("[2001:db8::1]:443", "2001:db8::1", 443));
+        assert!(!host_matches("[2001:db8::1]:443", "2001:db8::1", 80));
+        // No port → any port.
+        assert!(host_matches("[2001:db8::1]", "2001:db8::1", 80));
+    }
+
+    // --- pattern validation at ingestion --------------------------------------
+
+    #[test]
+    fn bare_ipv6_pattern_is_rejected_loudly() {
+        // The historical footgun: `2001:db8::1` read as host `2001:db8:` +
+        // port `1`, silently matching nothing. Must now refuse to load.
+        for pat in [
+            "2001:db8::1",     // parses as Ipv6Addr
+            "2001:db8::dead",  // parses as Ipv6Addr (non-numeric tail)
+            "2001:db8::1:443", // still a valid Ipv6Addr as a whole
+            "fe80::1%eth0",    // zone-id: colon-y but not parseable
+            "not:an:address",  // multiple colons, not IPv6
+        ] {
+            let y = format!("default: allow\nrules:\n  - deny: \"{pat}\"\n");
+            let err = serde_yaml::from_str::<FilterRules>(&y)
+                .expect_err(&format!("'{pat}' must be rejected"))
+                .to_string();
+            assert!(
+                err.contains("[") || err.contains("IPv6"),
+                "'{pat}' error should point at the bracket form, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_bracket_patterns_are_rejected() {
+        for pat in [
+            "[not-ipv6]",
+            "[2001:db8::1",       // unclosed
+            "[2001:db8::1]443",   // junk after ']'
+            "[2001:db8::1]:port", // non-numeric port
+            "*.[2001:db8::1]",    // wildcard on a literal
+        ] {
+            let y = format!("default: allow\nrules:\n  - deny: \"{pat}\"\n");
+            assert!(
+                serde_yaml::from_str::<FilterRules>(&y).is_err(),
+                "'{pat}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_patterns_still_load() {
+        let y = r#"
+default: allow
+rules:
+  - deny: "[2001:db8::1]"
+  - deny: "[2001:db8::2]:443"
+  - deny: "*.doubleclick.net"
+  - deny: "example.com:8443"
+  - deny: "203.0.113.4"
+"#;
+        let f: FilterRules = serde_yaml::from_str(y).unwrap();
+        assert_eq!(f.rules.len(), 5);
     }
 
     // --- decide (single ruleset) ---------------------------------------------
