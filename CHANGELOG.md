@@ -11,6 +11,8 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-11
+
 ### Added
 
 - **`systemctl status` now shows the live endpoints.** runic speaks the
