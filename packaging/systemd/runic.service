@@ -4,7 +4,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# notify: "active" = the SOCKS5 surface is really bound (runic sends READY=1
+# via sd_notify) and systemctl status shows a live "Status:" line with both
+# the SOCKS5 and admin endpoints — the discovery entry point in auto-port mode.
+Type=notify
 ExecStart=%h/.local/bin/runic --config %h/.config/runic/runic.yaml
 # Optional (leading "-"): only needed when the YAML references *_env
 # credentials. A config with no creds at all (e.g. fully API-driven) must

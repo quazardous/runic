@@ -55,6 +55,10 @@ pub async fn run(
         pool_size = initial.upstreams.len(),
         "runic listening"
     );
+    // Consolidated "up" line + systemd READY/STATUS (no-op outside systemd).
+    // Under Type=notify units this is what flips the unit to "active" — i.e.
+    // "active" means the SOCKS5 surface is really bound.
+    crate::announce::socks_bound(bound);
     warn_on_direct(&initial);
 
     loop {
@@ -94,6 +98,9 @@ pub async fn run(
                             stats.set_bound_addr(bound);
                             listener = new_l;
                             info!(addr = %bound, "rebound");
+                            // Keep the systemd STATUS line true: in auto-port
+                            // mode a rebind mints a new port.
+                            crate::announce::socks_bound(bound);
                         }
                         Err(e) => {
                             warn!(target_addr = %new_addr, error = %e, "rebind failed; staying on previous addr");

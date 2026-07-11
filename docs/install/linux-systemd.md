@@ -98,7 +98,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
 ExecStart=/usr/bin/runic --config %h/.config/runic/runic.yaml
 EnvironmentFile=-%h/.config/runic/creds.env
 NoNewPrivileges=yes
@@ -226,9 +226,21 @@ You already have the tarball's two support files in the repo clone:
 
 ## Smoke test
 
-Whichever path you took — with the default config the SOCKS5 port is
-auto-picked by the OS, so first read the real one from the status endpoint
-(the admin port is fixed):
+Whichever path you took, start with the service status — runic reports its
+live endpoints to systemd, so both ports are right there:
+
+```console
+$ systemctl --user status runic     # (or sudo systemctl status runic)
+     ...
+     Status: "SOCKS5 127.0.0.1:41475 · admin http://127.0.0.1:48484"
+```
+
+(Being a `Type=notify` unit, "active" also means the SOCKS5 surface is
+*really* bound — a service that can't bind never reaches "active".)
+
+For scripts, the same discovery works over the status endpoint — the SOCKS5
+port is auto-picked by the OS with the default config, the admin port is
+fixed:
 
 ```bash
 PROXY=$(curl -s http://127.0.0.1:48484/v1/status | grep -o '"listen":"[^"]*"' | cut -d'"' -f4)

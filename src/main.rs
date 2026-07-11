@@ -126,6 +126,9 @@ async fn main() -> Result<()> {
         stats.clone(),
     )
     .await?;
+    // The admin surface is up; the server task announces both endpoints (one
+    // consolidated log line + systemd READY/STATUS) once SOCKS5 binds.
+    runic::announce::set_admin_addr(admin_cfg.addr);
 
     let server_silo = silo.map(|(cache, _)| cache);
     server::run(cfg_rx, server_silo, stats).await

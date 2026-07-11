@@ -11,6 +11,19 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+### Added
+
+- **`systemctl status` now shows the live endpoints.** runic speaks the
+  systemd readiness protocol (sd_notify, hand-rolled, zero dependencies —
+  inert outside systemd and on non-Linux): once the SOCKS5 surface is bound
+  it reports `READY=1` plus a live status line —
+  `Status: "SOCKS5 127.0.0.1:41475 · admin http://127.0.0.1:48484"` — updated
+  on every rebind, so the ports are one `systemctl status` away instead of
+  buried in the journal. Both shipped units switch to `Type=notify`, which
+  also makes "active" mean "really bound": a service that can't bind never
+  reaches active instead of flapping. The boot also logs one consolidated
+  `runic up` line naming both endpoints (greppable in one shot).
+
 ### Changed
 
 - **A missing config file at the platform default path no longer aborts the
