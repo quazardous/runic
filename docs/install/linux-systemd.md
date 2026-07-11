@@ -117,6 +117,15 @@ unchanged: the optional `~/.config/runic/creds.env`, lingering, the smoke test.
 
 Two caveats:
 
+- **Don't skip the config copy.** The unit passes an **explicit** `--config`
+  path, and an explicit path must exist — runic exits with
+  `file not found — create it (an empty file is a valid config) or check the
+  path`, and `Restart=on-failure` turns that into a crash-loop
+  (`journalctl --user -u runic` shows the message; `systemctl status` only
+  shows the exit code). Only the *platform default* path
+  (`/etc/runic/runic.yaml`, i.e. running `runic` with no `--config` at all)
+  is allowed to be absent: there runic boots on built-in defaults with a
+  warning, and hot-loads the file if you create it later.
 - **Don't run both.** If the system service is enabled, disable it first
   (`sudo systemctl disable --now runic`) — otherwise the two instances fight
   over the same loopback ports.

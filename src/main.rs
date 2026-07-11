@@ -33,10 +33,14 @@ fn unix_now() -> u64 {
     about = "Local SOCKS5 proxy relaying via HTTP CONNECT upstream"
 )]
 struct Cli {
-    /// Path to the YAML config. Defaults to the platform config location:
-    /// `/etc/runic/runic.yaml` on Unix, `%APPDATA%\runic\runic.yaml` on Windows.
-    #[arg(short, long, default_value_os_t = paths::default_config_path())]
-    config: PathBuf,
+    /// Path to the YAML config. When omitted, the platform default is used
+    /// (`/etc/runic/runic.yaml` on Unix, `%APPDATA%\runic\runic.yaml` on
+    /// Windows) and is allowed to be absent — runic then boots on built-in
+    /// defaults, exactly like an empty file. A path passed explicitly must
+    /// exist: a typo'd --config silently booting on defaults (with the real
+    /// file elsewhere, never read) would be the worse footgun.
+    #[arg(short, long)]
+    config: Option<PathBuf>,
 
     #[arg(long, env = "RUNIC_LOG", default_value = "runic=info")]
     log: String,
@@ -51,7 +55,11 @@ async fn main() -> Result<()> {
         .with_target(true)
         .init();
 
-    let (cfg, admin_cfg, silo_cfg) = config::Config::load_with_admin(&cli.config)?;
+    // Explicit path = explicit intent (must exist); the platform default may
+    // be absent (fresh install, nothing configured yet — boot on defaults).
+    let explicit = cli.config.is_some();
+    let config_path = cli.config.unwrap_or_else(paths::default_config_path);
+    let (cfg, admin_cfg, silo_cfg) = config::Config::load_with_admin_opts(&config_path, !explicit)?;
     let snapshot_path = store::default_snapshot_path();
 
     // Silo mode (opt-in): the encrypted per-variation config store + its default
@@ -110,7 +118,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    watcher::spawn(cli.config.clone(), config_store.clone())?;
+    watcher::spawn(config_path.clone(), config_store.clone())?;
     admin::spawn(
         admin_cfg.addr,
         config_store.clone(),
