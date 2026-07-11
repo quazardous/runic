@@ -366,10 +366,45 @@ impl Config {
     }
 
     /// Load the full cold config: the data-plane `Config`, the boot-time `Admin`
-    /// listener address, and the optional `silo` settings.
+    /// listener address, and the optional `silo` settings. A missing file is an
+    /// error — see [`Self::load_with_admin_opts`] for the tolerant variant.
     pub fn load_with_admin(path: &Path) -> Result<(Self, Admin, Option<SiloConfig>)> {
-        let raw =
-            fs::read_to_string(path).with_context(|| format!("read config {}", path.display()))?;
+        Self::load_with_admin_opts(path, false)
+    }
+
+    /// [`Self::load_with_admin`] with a policy for a missing file.
+    ///
+    /// `tolerate_missing: true` treats an absent file as an empty one — boot on
+    /// built-in defaults, with a loud warning. Meant for the *platform default*
+    /// path, where absence just means "nothing configured yet" (the same intent
+    /// as the shipped fully-commented config). An explicitly passed `--config`
+    /// path should keep `false`: a typo'd path silently booting on defaults,
+    /// with the real file elsewhere and never read, is the worse footgun — so
+    /// the error there names the two ways out.
+    pub fn load_with_admin_opts(
+        path: &Path,
+        tolerate_missing: bool,
+    ) -> Result<(Self, Admin, Option<SiloConfig>)> {
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if tolerate_missing {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "config file not found; running on built-in defaults — \
+                         create the file to configure (an empty file is a valid config)"
+                    );
+                    String::new()
+                } else {
+                    return Err(anyhow!(
+                        "read config {}: file not found — create it (an empty file \
+                         is a valid config) or check the path",
+                        path.display()
+                    ));
+                }
+            }
+            Err(e) => return Err(e).with_context(|| format!("read config {}", path.display())),
+        };
         // `Option<_>`: an empty or comment-only file parses as a null document,
         // which must mean "all defaults", not a parse error.
         let file: RawFile = serde_yaml::from_str::<Option<RawFile>>(&raw)
@@ -452,6 +487,30 @@ upstreams:
         assert!(silo.is_none());
         assert!(cfg.filter.rules.is_empty());
         assert!(cfg.silo_floor_filter.rules.is_empty());
+    }
+
+    #[test]
+    fn missing_file_errors_with_actionable_message_by_default() {
+        // Explicit-path policy: absence is fatal (typo guard), but the error
+        // names the two ways out.
+        let path = std::env::temp_dir().join("runic-test-no-such-config.yaml");
+        let err = Config::load_with_admin(&path).unwrap_err().to_string();
+        assert!(err.contains("file not found"), "got: {err}");
+        assert!(err.contains("empty file is a valid config"), "got: {err}");
+        assert!(err.contains("check the path"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_file_tolerated_boots_on_defaults() {
+        // Default-path policy: absence = "nothing configured yet" — identical
+        // to loading an empty file.
+        let path = std::env::temp_dir().join("runic-test-no-such-config.yaml");
+        let (cfg, admin, silo) =
+            Config::load_with_admin_opts(&path, true).expect("missing file tolerated");
+        assert_eq!(cfg.listen.addr, "127.0.0.1:0".parse().unwrap());
+        assert_eq!(admin.addr, "127.0.0.1:48484".parse().unwrap());
+        assert!(cfg.upstreams.is_empty());
+        assert!(silo.is_none());
     }
 
     #[test]

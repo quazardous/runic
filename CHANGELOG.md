@@ -11,6 +11,25 @@ humans, not machines"), and the project follows
 
 ## [Unreleased]
 
+### Changed
+
+- **A missing config file at the platform default path no longer aborts the
+  boot.** Running `runic` without `--config` when `/etc/runic/runic.yaml`
+  (or the Windows equivalent) doesn't exist now boots on built-in defaults —
+  the same meaning as an empty file — with a loud warning, and the watcher
+  monitors the parent directory: create the file later and it hot-loads, no
+  restart. An **explicitly passed** `--config` path must still exist: a
+  typo'd path silently booting on defaults (with the real file elsewhere,
+  never read) would be the worse footgun, so that guard stays.
+
+### Fixed
+
+- **The missing-config error now says how to get out.** Instead of a bare
+  `read config <path>: No such file or directory` (which, under systemd's
+  `Restart=on-failure`, surfaces as a silent crash-loop with the cause buried
+  in the journal), the error reads: `file not found — create it (an empty
+  file is a valid config) or check the path`.
+
 ## [0.12.0] - 2026-07-10
 
 ### Added
