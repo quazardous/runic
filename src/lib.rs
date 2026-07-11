@@ -11,6 +11,7 @@
 //! `%APPDATA%`-vs-XDG default resolver shared with the tray.
 
 pub mod admin;
+pub mod announce;
 pub mod config;
 pub mod filter;
 pub mod paths;
