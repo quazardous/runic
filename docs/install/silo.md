@@ -154,13 +154,40 @@ curl -X POST http://127.0.0.1:48484/v1/silo/open \
 
 then points the browser at `socks5://127.0.0.1:41987` (no auth). runic serves
 that port from the client's config. Idle ports are torn down (the same
-keep-alive that evicts the decrypted config from RAM).
+keep-alive that evicts the decrypted config from RAM — see
+[Keep-alive](#keep-alive)).
 
 **Port lifecycle.** While a token is warm, re-opening with it returns the **same**
 port (the call is idempotent — cheap to repeat). After an idle teardown, the port
 is released and a fresh open binds a **new** one. So clients should **re-open
 whenever they need to route and use the port returned**, rather than caching a
 port across idle periods.
+
+## Keep-alive
+
+A decrypted config (and its `none`-mode port) stays warm for **5 minutes** after
+its last use, then is evicted from RAM and the port torn down. Two things count
+as "use" and refresh that window:
+
+- **The traffic itself.** Every SOCKS5 connection served from the config —
+  a data connection on the dedicated port, or an `rfc1929` connection presenting
+  the token — touches it. A browser that is actively loading pages never loses
+  its port; only a fully silent 5 minutes triggers the teardown.
+- **Any admin call presenting the `Bearer` token** (`GET /v1/config`, a config
+  push, …).
+
+The canonical keep-alive is a periodic **`POST /v1/silo/open` + `Bearer`**: it
+refreshes the window, returns the **same** port while the config is warm, and is
+self-healing — if the port already fell, the same call re-warms the config and
+binds a fresh port (the only case where the number changes). A client that must
+hold a port through possibly-idle stretches (a browser between tasks) should
+re-open on a timer shorter than the window — every ~4 minutes — and always use
+the `port` from the latest response.
+
+Note the two TTLs are different things: the **idle window** (minutes, RAM) only
+governs warmth and ports; `ttl_days` (days, disk) governs when an untouched
+encrypted blob is garbage-collected. An evicted config is *not* lost — the next
+`open` with its token decrypts it again.
 
 ## Lifecycle
 
